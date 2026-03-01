@@ -108,10 +108,38 @@ class Compiler(ast.NodeVisitor):
             return self.types['None']
 
         elif isinstance(annotation_node, ast.Subscript):
-            if not isinstance(annotation_node.value, ast.Name) or annotation_node.value.id != 'ptr':
-                raise TypeError("Invalid pointer syntax, expected 'ptr[...]'")
-            inner_type = self._get_type(annotation_node.slice)
-            return ir.PointerType(inner_type)
+            if not isinstance(annotation_node.value, ast.Name):
+                raise TypeError(f"Unsupported subscript type annotation: {ast.dump(annotation_node)}")
+            head = annotation_node.value.id
+            if head == 'ptr':
+                inner_type = self._get_type(annotation_node.slice)
+                return ir.PointerType(inner_type)
+            elif head == 'array':
+                # array[T, N] — fixed-size stack-allocated array
+                slice_node = annotation_node.slice
+                # In Python 3.9+ the slice of a two-element subscript is a Tuple node
+                if isinstance(slice_node, ast.Tuple) and len(slice_node.elts) == 2:
+                    elem_type = self._get_type(slice_node.elts[0])
+                    count_node = slice_node.elts[1]
+                    if not isinstance(count_node, ast.Constant) or not isinstance(count_node.value, int):
+                        raise TypeError("array[T, N]: N must be an integer literal")
+                    count = count_node.value
+                elif isinstance(slice_node, ast.Index):
+                    # Python 3.8 wraps slices in ast.Index
+                    inner = slice_node.value
+                    if isinstance(inner, ast.Tuple) and len(inner.elts) == 2:
+                        elem_type = self._get_type(inner.elts[0])
+                        count_node = inner.elts[1]
+                        if not isinstance(count_node, ast.Constant) or not isinstance(count_node.value, int):
+                            raise TypeError("array[T, N]: N must be an integer literal")
+                        count = count_node.value
+                    else:
+                        raise TypeError("array[T, N]: expected two-element subscript, e.g. array[int, 64]")
+                else:
+                    raise TypeError("array[T, N]: expected two-element subscript, e.g. array[int, 64]")
+                return ir.ArrayType(elem_type, count)
+            else:
+                raise TypeError(f"Unknown subscript type annotation head '{head}': expected 'ptr' or 'array'")
 
         elif isinstance(annotation_node, ast.Index):
              return self._get_type(annotation_node.value)
@@ -418,7 +446,12 @@ class Compiler(ast.NodeVisitor):
 
     def visit_Name(self, node):
         if node.id in self.local_scope:
-            return self.builder.load(self.local_scope[node.id], name=node.id)
+            alloc = self.local_scope[node.id]
+            # For stack-allocated arrays, return the alloca pointer directly —
+            # loading the entire array is not a valid LLVM IR operation.
+            if isinstance(alloc.type, ir.PointerType) and isinstance(alloc.type.pointee, ir.ArrayType):
+                return alloc
+            return self.builder.load(alloc, name=node.id)
         elif node.id in self.global_scope:
             return self.global_scope[node.id]
         elif node.id in self.types:
@@ -434,8 +467,38 @@ class Compiler(ast.NodeVisitor):
             return self.builder.add(lhs, rhs, name='addtmp')
         elif isinstance(op, ast.Sub):
             return self.builder.sub(lhs, rhs, name='subtmp')
+        elif isinstance(op, ast.Mult):
+            return self.builder.mul(lhs, rhs, name='multmp')
+        elif isinstance(op, ast.BitAnd):
+            return self.builder.and_(lhs, rhs, name='andtmp')
+        elif isinstance(op, ast.BitOr):
+            return self.builder.or_(lhs, rhs, name='ortmp')
+        elif isinstance(op, ast.BitXor):
+            return self.builder.xor(lhs, rhs, name='xortmp')
+        elif isinstance(op, ast.LShift):
+            return self.builder.shl(lhs, rhs, name='shltmp')
+        elif isinstance(op, ast.RShift):
+            # Logical (unsigned) right shift for bitwise/SHA-256 use
+            return self.builder.lshr(lhs, rhs, name='lshrtmp')
+        elif isinstance(op, ast.Mod):
+            return self.builder.srem(lhs, rhs, name='sremtmp')
         else:
             raise NotImplementedError(f"Unsupported binary operator: {type(op).__name__}")
+
+    def visit_UnaryOp(self, node):
+        operand = self.visit(node.operand)
+        op = node.op
+        if isinstance(op, ast.Invert):
+            # Bitwise NOT: XOR with all-ones (-1 in two's complement)
+            all_ones = ir.Constant(operand.type, -1)
+            return self.builder.xor(operand, all_ones, name='nottmp')
+        elif isinstance(op, ast.USub):
+            zero = ir.Constant(operand.type, 0)
+            return self.builder.sub(zero, operand, name='negtmp')
+        elif isinstance(op, ast.UAdd):
+            return operand
+        else:
+            raise NotImplementedError(f"Unsupported unary operator: {type(op).__name__}")
 
     def visit_Compare(self, node):
         lhs = self.visit(node.left)
@@ -546,7 +609,13 @@ class Compiler(ast.NodeVisitor):
         ptr = self.visit(node.value)
         idx = self.visit(node.slice)
 
-        addr = self.builder.gep(ptr, [idx], inbounds=True, name='addr')
+        # For a stack-allocated array (alloca of ArrayType), the alloca pointer
+        # has type [N x T]*. GEP needs [0, idx] to produce a T* element pointer.
+        if isinstance(ptr.type, ir.PointerType) and isinstance(ptr.type.pointee, ir.ArrayType):
+            zero = ir.Constant(ir.IntType(64), 0)
+            addr = self.builder.gep(ptr, [zero, idx], inbounds=True, name='addr')
+        else:
+            addr = self.builder.gep(ptr, [idx], inbounds=True, name='addr')
         return self.builder.load(addr, name='val')
 
     def visit_Index(self, node):
@@ -608,14 +677,47 @@ class Compiler(ast.NodeVisitor):
         self.local_scope[var_name] = var_alloc
 
         if node.value:
+            if isinstance(var_type, ir.ArrayType):
+                raise NotImplementedError(
+                    f"Array variable '{var_name}': initializer not supported — "
+                    "declare without a value and assign elements individually"
+                )
             value = self.visit(node.value)
             self.builder.store(value, var_alloc)
 
         # Tag variable with current arena context
         self.arena_tags[var_name] = self.current_arena
 
+    def _subscript_ptr(self, node):
+        """Return the GEP pointer for a Subscript node without loading the value.
+
+        Used by visit_Assign to get the store target for arr[i] = val.
+        """
+        ptr = self.visit(node.value)
+        idx = self.visit(node.slice)
+
+        # For an alloca'd array (ir.ArrayType), GEP needs a leading 0 index
+        # to step into the array before indexing the element.
+        if isinstance(ptr.type, ir.PointerType) and isinstance(ptr.type.pointee, ir.ArrayType):
+            zero = ir.Constant(ir.IntType(64), 0)
+            return self.builder.gep(ptr, [zero, idx], inbounds=True, name='addr')
+        return self.builder.gep(ptr, [idx], inbounds=True, name='addr')
+
     def visit_Assign(self, node):
-        var_name = node.targets[0].id
+        target = node.targets[0]
+
+        # Array element assignment: arr[i] = val
+        if isinstance(target, ast.Subscript):
+            addr = self._subscript_ptr(target)
+            value = self.visit(node.value)
+            self.builder.store(value, addr)
+            return
+
+        # Plain name assignment
+        if not isinstance(target, ast.Name):
+            raise NotImplementedError(f"Unsupported assignment target: {ast.dump(target)}")
+
+        var_name = target.id
 
         if var_name not in self.local_scope:
             raise NameError(f"Cannot assign to undeclared variable: {var_name}")

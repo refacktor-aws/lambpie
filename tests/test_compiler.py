@@ -173,3 +173,384 @@ def handle(event: Request) -> Response:
     llvm_ir, _ = compile_lambpie_code(code)
     assert 'target triple = "x86_64-unknown-linux-gnu"' in llvm_ir, \
         "Default target should be Lambda triple"
+
+
+# ---------------------------------------------------------------------------
+# Item 5: SHA-256 prerequisites — bitwise operations
+# ---------------------------------------------------------------------------
+
+def _int_op_handle(body_expr):
+    """Helper: wrap a single-int-field Request/Response around a body expression."""
+    return f"""
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = {body_expr}
+    return Response(result)
+"""
+
+
+def test_bitwise_and():
+    """BinOp & emits 'and i64' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x & 255"))
+    assert "and i64" in llvm_ir, "Bitwise AND should emit 'and i64'"
+
+
+def test_bitwise_or():
+    """BinOp | emits 'or i64' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x | 1"))
+    assert "or i64" in llvm_ir, "Bitwise OR should emit 'or i64'"
+
+
+def test_bitwise_xor():
+    """BinOp ^ emits 'xor i64' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x ^ 42"))
+    assert "xor i64" in llvm_ir, "Bitwise XOR should emit 'xor i64'"
+
+
+def test_bitwise_not():
+    """UnaryOp ~ emits 'xor i64 ..., -1' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("~event.x"))
+    # Bitwise NOT is lowered as XOR with -1
+    assert "xor i64" in llvm_ir, "Bitwise NOT should emit 'xor i64'"
+    assert "-1" in llvm_ir, "Bitwise NOT mask should be -1 (all ones)"
+
+
+def test_left_shift():
+    """BinOp << emits 'shl i64' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x << 3"))
+    assert "shl i64" in llvm_ir, "Left shift should emit 'shl i64'"
+
+
+def test_right_shift():
+    """BinOp >> emits 'lshr i64' (logical shift right) in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x >> 2"))
+    assert "lshr i64" in llvm_ir, "Right shift should emit 'lshr i64'"
+
+
+def test_modulo():
+    """BinOp % emits 'srem i64' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x % 7"))
+    assert "srem i64" in llvm_ir, "Modulo should emit 'srem i64'"
+
+
+def test_subtraction():
+    """BinOp - emits 'sub i64' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x - 1"))
+    assert "sub i64" in llvm_ir, "Subtraction should emit 'sub i64'"
+
+
+def test_multiplication():
+    """BinOp * emits 'mul i64' in IR."""
+    llvm_ir, _ = compile_lambpie_code(_int_op_handle("event.x * 3"))
+    assert "mul i64" in llvm_ir, "Multiplication should emit 'mul i64'"
+
+
+def test_compare_lt():
+    """Compare < emits 'icmp slt' in IR."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = 0
+    if event.x < 10:
+        result = 1
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "icmp slt" in llvm_ir, "Less-than compare should emit 'icmp slt'"
+
+
+def test_compare_gt():
+    """Compare > emits 'icmp sgt' in IR."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = 0
+    if event.x > 10:
+        result = 1
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "icmp sgt" in llvm_ir, "Greater-than compare should emit 'icmp sgt'"
+
+
+def test_compare_lte():
+    """Compare <= emits 'icmp sle' in IR."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = 0
+    if event.x <= 10:
+        result = 1
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "icmp sle" in llvm_ir, "Less-than-or-equal compare should emit 'icmp sle'"
+
+
+def test_compare_gte():
+    """Compare >= emits 'icmp sge' in IR."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = 0
+    if event.x >= 10:
+        result = 1
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "icmp sge" in llvm_ir, "Greater-than-or-equal compare should emit 'icmp sge'"
+
+
+def test_compare_eq():
+    """Compare == emits 'icmp eq' in IR."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = 0
+    if event.x == 0:
+        result = 1
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "icmp eq" in llvm_ir, "Equality compare should emit 'icmp eq'"
+
+
+def test_compare_ne():
+    """Compare != emits 'icmp ne' in IR."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = 0
+    if event.x != 0:
+        result = 1
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "icmp ne" in llvm_ir, "Not-equal compare should emit 'icmp ne'"
+
+
+def test_while_loop():
+    """While loop emits loop.header / loop.body / loop.exit blocks."""
+    code = """
+class Request:
+    n: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    i: int = 0
+    s: int = 0
+    while i < event.n:
+        s = s + i
+        i = i + 1
+    return Response(s)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "loop.header" in llvm_ir, "While loop should emit loop.header block"
+    assert "loop.body" in llvm_ir, "While loop should emit loop.body block"
+    assert "loop.exit" in llvm_ir, "While loop should emit loop.exit block"
+
+
+def test_while_loop_with_bitwise():
+    """While loop body can contain bitwise operations (foundation for SHA-256 rounds)."""
+    code = """
+class Request:
+    n: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    i: int = 0
+    acc: int = 0
+    while i < 32:
+        acc = acc ^ (event.n >> i)
+        acc = acc & 4294967295
+        i = i + 1
+    return Response(acc)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "loop.header" in llvm_ir
+    assert "xor i64" in llvm_ir
+    assert "lshr i64" in llvm_ir
+    assert "and i64" in llvm_ir
+
+
+def test_array_declaration():
+    """array[int, N] declares a fixed-size stack array of [N x i64]."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    buf: array[int, 16]
+    buf[0] = event.x
+    result: int = buf[0]
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "[16 x i64]" in llvm_ir, "array[int, 16] should produce [16 x i64] type"
+
+
+def test_array_store_and_load():
+    """Array element store (arr[i] = val) and load (arr[i]) round-trip."""
+    code = """
+class Request:
+    a: int
+    b: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    scratch: array[int, 4]
+    scratch[0] = event.a
+    scratch[1] = event.b
+    scratch[2] = scratch[0] + scratch[1]
+    result: int = scratch[2]
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    # Should have stores and loads into [4 x i64]
+    assert "[4 x i64]" in llvm_ir, "array[int, 4] should produce [4 x i64]"
+    assert "store i64" in llvm_ir, "Array element assignment should emit store"
+
+
+def test_array_with_while_loop():
+    """Array + while loop: fill array elements via loop index."""
+    code = """
+class Request:
+    seed: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    w: array[int, 8]
+    i: int = 0
+    while i < 8:
+        w[i] = event.seed ^ i
+        i = i + 1
+    result: int = w[0] ^ w[7]
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "[8 x i64]" in llvm_ir
+    assert "loop.header" in llvm_ir
+    assert "xor i64" in llvm_ir
+
+
+def test_local_variable_assignment():
+    """Plain assignment to declared local variable (without type annotation)."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    v: int = 0
+    v = event.x + 10
+    return Response(v)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "store i64" in llvm_ir, "Assignment should emit store"
+
+
+def test_local_variable_assign_undeclared_raises():
+    """Assigning to an undeclared variable raises NameError."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    undeclared = event.x + 1
+    return Response(undeclared)
+"""
+    with pytest.raises(NameError, match="Cannot assign to undeclared variable"):
+        compile_lambpie_code(code)
+
+
+def test_unsupported_binop_raises():
+    """Unsupported binary operator raises NotImplementedError, not a silent fallback."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    result: int = event.x // 2
+    return Response(result)
+"""
+    with pytest.raises(NotImplementedError, match="Unsupported binary operator"):
+        compile_lambpie_code(code)
+
+
+def test_combined_bitwise_expression():
+    """Complex nested bitwise expression emits correct IR instructions."""
+    code = """
+class Request:
+    x: int
+
+class Response:
+    result: int
+
+def handle(event: Request) -> Response:
+    a: int = (event.x << 3) | (event.x >> 29)
+    b: int = a ^ 2654435769
+    c: int = ~b & 4294967295
+    result: int = c % 256
+    return Response(result)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    assert "shl i64" in llvm_ir
+    assert "lshr i64" in llvm_ir
+    assert "or i64" in llvm_ir
+    assert "xor i64" in llvm_ir
+    assert "and i64" in llvm_ir
+    assert "srem i64" in llvm_ir

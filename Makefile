@@ -1,8 +1,13 @@
-.PHONY: test ir build package verify clean
+.PHONY: test arena-test ir build package verify clean
 
 # Unit tests (compiler only, runs on host)
 test:
 	python -m pytest tests/test_compiler.py -v
+
+# Arena stress test — multi-invocation stability, mprotect freeze, cursor reset.
+# Requires Docker (runs on Linux inside amazonlinux:2023 container).
+arena-test:
+	python scripts/test_arena.py
 
 # Compile .pie to LLVM IR (runs on host, needs llvmlite)
 ir:

@@ -39,13 +39,25 @@ void arena_reset(arena *a) {
 }
 
 void arena_freeze(arena *a) {
-    // Make the used portion read-only. Writes after freeze cause SIGSEGV.
-    size_t used = a->cursor - a->base;
-    if (used > 0) {
-        // Round up to page boundary for mprotect
-        int pagesize = getpagesize();
-        size_t prot_size = (used + pagesize - 1) & ~(pagesize - 1);
-        mprotect(a->base, prot_size, PROT_READ);
+    /*
+     * Make the ENTIRE arena mapping read-only, not just the used portion.
+     *
+     * Original code only protected (cursor - base) bytes rounded up to a page.
+     * That left the unused tail (cursor..limit) still writable, so a post-freeze
+     * arena_alloc() would silently succeed if the bump landed in the unprotected
+     * tail.  Protecting the full capacity makes any write — to used or unused
+     * bytes — fault immediately, which is the intended invariant.
+     *
+     * mprotect requires page-aligned length; the arena was mmap'd with MAP_ANONYMOUS
+     * so its size is always a multiple of the page size.
+     */
+    size_t capacity = (size_t)(a->limit - a->base);
+    if (capacity > 0) {
+        int rc = mprotect(a->base, capacity, PROT_READ);
+        if (rc != 0) {
+            fprintf(stderr, "arena_freeze: mprotect failed\n");
+            exit(1);
+        }
     }
 }
 

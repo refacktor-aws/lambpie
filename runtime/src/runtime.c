@@ -12,8 +12,11 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "runtime.h"
+#include "log.h"
 
 /*
  * The Lambda Runtime API is a plain HTTP/1.1 service on the loopback address.
@@ -30,9 +33,9 @@
 
 struct runtime {
     http_recv_buffer *hb;
-    struct addrinfo *runtime_addrinfo;
-    const char *runtime_api;
-    char *response_buffer;
+    struct addrinfo  *runtime_addrinfo;
+    const char       *runtime_api;
+    char             *response_buffer;
 };
 
 /* ---------------------------------------------------------------------------
@@ -41,7 +44,7 @@ struct runtime {
 
 static inline struct addrinfo *resolve_host(const char *endpoint)
 {
-    DEBUG("Resolving endpoint: %s\n", endpoint);
+    LOG_VERBOSE_F("resolving endpoint: %s", endpoint);
 
     /* Split "host:port" — port is mandatory per the Lambda spec. */
     const char *colon = strchr(endpoint, ':');
@@ -50,22 +53,24 @@ static inline struct addrinfo *resolve_host(const char *endpoint)
     if (colon != NULL)
     {
         size_t host_len = (size_t)(colon - endpoint);
-        FATAL(host_len >= sizeof(host_no_port), "Host portion of AWS_LAMBDA_RUNTIME_API is too long");
+        FATAL(host_len >= sizeof(host_no_port),
+              "Host portion of AWS_LAMBDA_RUNTIME_API is too long");
         memcpy(host_no_port, endpoint, host_len);
         host_no_port[host_len] = '\0';
         port = colon + 1;
     }
     else
     {
-        /* Lambda always provides host:port, but fall back to port 80 rather
-         * than silently proceeding with a garbage address. */
+        /* Lambda always provides host:port; no port means misconfiguration. */
         size_t ep_len = strlen(endpoint);
-        FATAL(ep_len >= sizeof(host_no_port), "AWS_LAMBDA_RUNTIME_API value is too long");
+        FATAL(ep_len >= sizeof(host_no_port),
+              "AWS_LAMBDA_RUNTIME_API value is too long");
         memcpy(host_no_port, endpoint, ep_len + 1);
         port = "80";
-        LOG("WARNING: AWS_LAMBDA_RUNTIME_API has no port, defaulting to 80\n");
+        LOG_ERROR("AWS_LAMBDA_RUNTIME_API has no port — defaulting to 80 (likely misconfiguration)");
     }
-    DEBUG("Parsed endpoint into host=[%s] and port=[%s]\n", host_no_port, port);
+
+    LOG_VERBOSE_F("resolved endpoint: host=[%s] port=[%s]", host_no_port, port);
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -76,7 +81,6 @@ static inline struct addrinfo *resolve_host(const char *endpoint)
     struct addrinfo *dns_result;
 
     int rc = getaddrinfo(host_no_port, port, &hints, &dns_result);
-    DEBUG("getaddrinfo[%s:%s] returned rc=%d\n", host_no_port, port, rc);
     FATAL(rc != 0, "getaddrinfo failed for AWS_LAMBDA_RUNTIME_API");
     (void)rc;
     return dns_result;
@@ -90,7 +94,6 @@ static int send_all(int sockfd, const char *buf, int len)
         int rc = send(sockfd, buf + total_sent, len - total_sent, 0);
         FATAL(rc < 0, "send() failed");
         total_sent += rc;
-        DEBUG("Sent %d bytes, total sent=%d\n", rc, total_sent);
     }
     return total_sent;
 }
@@ -99,53 +102,50 @@ static int send_all(int sockfd, const char *buf, int len)
  * socket_connect — create and connect a TCP socket.
  *
  * rcvtimeo_sec controls SO_RCVTIMEO:
- *   0  → no timeout (used for /next — Lambda blocks this until an event arrives,
- *         which can be minutes on a warm container)
- *  >0  → timeout in whole seconds (used for /response POST)
- *
- * A 1-second receive timeout on /next would kill every warm invocation that
- * idles longer than 1 second, which is the common case.
+ *   0  — no timeout (used for /next, which long-polls — may block for minutes)
+ *  >0  — timeout in whole seconds (used for response/error POSTs)
  */
 static int socket_connect(const struct addrinfo *addr, int rcvtimeo_sec)
 {
-    DEBUG("Creating socket\n");
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     FATAL(sockfd < 0, "socket() failed");
 
     if (rcvtimeo_sec > 0)
     {
-        DEBUG("Setting SO_RCVTIMEO to %d second(s)\n", rcvtimeo_sec);
         struct timeval timeout = {
             .tv_sec  = rcvtimeo_sec,
             .tv_usec = 0
         };
-        int rc = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        int rc = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                            &timeout, sizeof(timeout));
         FATAL(rc < 0, "setsockopt(SO_RCVTIMEO) failed");
         (void)rc;
     }
 
-    DEBUG("Connecting socket\n");
     int rc = connect(sockfd, addr->ai_addr, addr->ai_addrlen);
     FATAL(rc < 0, "connect() to Lambda Runtime API failed");
-    DEBUG("Connected\n");
     return sockfd;
 }
 
 /* ---------------------------------------------------------------------------
  * HTTP helper
  *
- * Sends one HTTP request and parses the response into hb.
+ * Sends one HTTP request and parses the response status + headers into hb.
  * rcvtimeo_sec is forwarded to socket_connect (0 = blocking).
+ * recv_buf_size is the usable capacity of hb->buffer.data; it must be at
+ * least as large as the response headers + body combined.  For normal
+ * invocation traffic this is INCOMING_LAMBDA_REQUEST_BUFFER_SIZE (6 MB+).
+ * For error POSTs (tiny response bodies) a small buffer is fine.
  * --------------------------------------------------------------------------- */
 
 static void http(const runtime *rt, const char *path, const char *method,
-                 const char *content, int req_content_length, int rcvtimeo_sec)
+                 const char *content, int req_content_length, int rcvtimeo_sec,
+                 int recv_buf_size)
 {
-    const char *host = rt->runtime_api;
+    const char *host         = rt->runtime_api;
     const struct addrinfo *addr = rt->runtime_addrinfo;
-    http_recv_buffer *hb = rt->hb;
+    http_recv_buffer *hb    = rt->hb;
 
-    DEBUG("Making HTTP request to host=[%s], path=[%s], method=[%s]\n", host, path, method);
     int sockfd = socket_connect(addr, rcvtimeo_sec);
 
     char request[MAX_HTTP_HEADER_SIZE];
@@ -154,7 +154,6 @@ static void http(const runtime *rt, const char *path, const char *method,
              "Content-Length: %d\r\n\r\n",
              method, path, host, req_content_length);
 
-    DEBUG("Request headers:\n<<<\n%s\n>>>\n", request);
     send_all(sockfd, request, (int)strlen(request));
 
     if (req_content_length > 0)
@@ -168,27 +167,28 @@ static void http(const runtime *rt, const char *path, const char *method,
     char *body_start  = NULL;
     int   total_bytes_received = 0;
     int   content_length       = -1;
-    int   remain               = INCOMING_LAMBDA_REQUEST_BUFFER_SIZE;
+    int   remain               = recv_buf_size;
     char *delimiter            = NULL;
     hb->body.data        = NULL;
     hb->awsRequestId.data = NULL;
 
     while (remain)
     {
-        FATAL(parse_point >= response + INCOMING_LAMBDA_REQUEST_BUFFER_SIZE,
+        FATAL(parse_point >= response + recv_buf_size,
               "HTTP response buffer overflow");
 
         if (parse_point >= response + total_bytes_received)
         {
-            DEBUG("Calling recv with ptr=%d, remain=%d\n", total_bytes_received, remain);
             int bytes_received;
             do
             {
-                bytes_received = recv(sockfd, response + total_bytes_received, (size_t)remain, 0);
+                bytes_received = recv(sockfd,
+                                      response + total_bytes_received,
+                                      (size_t)remain, 0);
             } while (bytes_received < 0 && errno == EINTR);
 
-            DEBUG("Received %d bytes\n", bytes_received);
-            FATAL(bytes_received <= 0, "recv() returned 0 or error — connection closed by Lambda Runtime API");
+            FATAL(bytes_received <= 0,
+                  "recv() returned 0 or error — connection closed by Lambda Runtime API");
 
             total_bytes_received += bytes_received;
             remain               -= bytes_received;
@@ -205,29 +205,34 @@ static void http(const runtime *rt, const char *path, const char *method,
         }
         else if (*parse_point == '\n')
         {
-            FATAL(parse_point - response < 3, "Unexpected line break in HTTP response before headers");
-            FATAL(parse_point[-1] != '\r', "Malformed HTTP line break: missing \\r before \\n");
+            FATAL(parse_point - response < 3,
+                  "Unexpected line break in HTTP response before headers");
+            FATAL(parse_point[-1] != '\r',
+                  "Malformed HTTP line break: missing \\r before \\n");
 
             if (parse_point[-2] == '\n')
             {
-                /* End of headers: blank line (\r\n\r\n seen as \n...\n). */
-                FATAL(content_length < 0, "HTTP response missing Content-Length header");
+                /* End of headers: blank line (\r\n\r\n). */
+                FATAL(content_length < 0,
+                      "HTTP response missing Content-Length header");
                 body_start = parse_point + 1;
-                remain     = content_length - ((response + total_bytes_received) - body_start);
-                DEBUG("BODY START: %p, remain=%d\n", body_start, remain);
+                remain     = content_length
+                             - ((response + total_bytes_received) - body_start);
                 parse_point = response + total_bytes_received;
                 continue;
             }
 
             if (delimiter == NULL)
             {
-                /* Status line (no ':' found on this line). */
-                if (total_bytes_received >= 12 && !memcmp(line_start, "HTTP/1.0 410", 12))
+                /* Status line (no ':' found). */
+                if (total_bytes_received >= 12
+                    && !memcmp(line_start, "HTTP/1.0 410", 12))
                 {
-                    /* 410 means Lambda is shutting down the container.
-                     * Exit cleanly — CloudWatch will capture anything written
-                     * to stderr before this point. */
-                    LOG("Lambda container shutdown (HTTP 410)\n");
+                    /*
+                     * 410: Lambda is shutting down the container.
+                     * Exit cleanly; CloudWatch captures stderr up to this point.
+                     */
+                    LOG_INFO("Lambda container shutdown received (HTTP 410) — exiting");
                     close(sockfd);
                     exit(0);
                 }
@@ -236,15 +241,13 @@ static void http(const runtime *rt, const char *path, const char *method,
                               (size_t)(delimiter - line_start)))
             {
                 content_length = atoi(delimiter + 2);
-                DEBUG("HEADER Content-Length: %d\n", content_length);
             }
             else if (!strncmp(line_start, "Lambda-Runtime-Aws-Request-Id:",
                               (size_t)(delimiter - line_start)))
             {
                 hb->awsRequestId.data = delimiter + 2;
-                hb->awsRequestId.len  = (size_t)(parse_point - hb->awsRequestId.data) - 1; /* strip \r */
-                DEBUG("HEADER Lambda-Runtime-Aws-Request-Id: [%.*s]\n",
-                      (int)hb->awsRequestId.len, hb->awsRequestId.data);
+                hb->awsRequestId.len  =
+                    (size_t)(parse_point - hb->awsRequestId.data) - 1; /* strip \r */
             }
 
             line_start = parse_point + 1;
@@ -254,13 +257,11 @@ static void http(const runtime *rt, const char *path, const char *method,
         ++parse_point;
     }
 
-    DEBUG("Total bytes received: %d\n", total_bytes_received);
     response[total_bytes_received] = '\0';
     hb->buffer.len = (size_t)total_bytes_received;
     hb->body.data  = body_start;
     hb->body.len   = (size_t)(total_bytes_received - (body_start - response));
     close(sockfd);
-    DEBUG("Response received\n");
 }
 
 /* ---------------------------------------------------------------------------
@@ -277,16 +278,141 @@ static void *mapalloc(size_t size)
                      PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                      -1, 0);
-    FATAL(ptr == MAP_FAILED, "mmap() failed — cannot allocate runtime buffers");
+    FATAL(ptr == MAP_FAILED,
+          "mmap() failed — cannot allocate runtime buffers");
 
-    /* Install a PROT_NONE guard page at the end so overflows SIGSEGV loudly. */
-    int rc = mprotect((char *)ptr + (size - (size_t)pagesize), (size_t)pagesize, PROT_NONE);
+    /* Guard page: PROT_NONE so overflows SIGSEGV loudly. */
+    int rc = mprotect((char *)ptr + (size - (size_t)pagesize),
+                      (size_t)pagesize, PROT_NONE);
     FATAL(rc != 0, "mprotect() failed — cannot install guard page");
     (void)rc;
 
-    DEBUG("Allocated %zu bytes at %p (guard page at %p)\n",
-          size, ptr, (char *)ptr + (size - (size_t)pagesize));
     return ptr;
+}
+
+/* ---------------------------------------------------------------------------
+ * Error endpoint helpers
+ *
+ * Lambda error JSON format (mandated by the Runtime API spec):
+ *   {"errorMessage":"...","errorType":"...","stackTrace":[]}
+ *
+ * We serialise this by hand into a stack buffer (MAX_HTTP_HEADER_SIZE covers
+ * it with ease) — no allocation, no json.c dependency here.
+ * --------------------------------------------------------------------------- */
+
+/*
+ * write_error_json — serialise the Lambda error JSON into buf[0..bufsize).
+ * Returns the number of bytes written (not including a NUL terminator).
+ * FATALs if the buffer is too small (callers use a 4 KB stack buffer, which
+ * is ample for any reasonable error_type + error_message pair).
+ */
+static int write_error_json(char *buf, int bufsize,
+                            const char *error_type,
+                            const char *error_message)
+{
+    int n = snprintf(buf, (size_t)bufsize,
+                     "{\"errorMessage\":\"%s\","
+                     "\"errorType\":\"%s\","
+                     "\"stackTrace\":[]}",
+                     error_message, error_type);
+    FATAL(n < 0 || n >= bufsize,
+          "write_error_json: error payload too large for internal buffer");
+    return n;
+}
+
+/*
+ * send_error_response — POST error JSON to the invocation error endpoint.
+ *
+ * Called after lambpie_handle() returns a failure code or otherwise
+ * signals an error.  The Lambda service marks this invocation as failed
+ * and routes the next event to the same execution environment.
+ */
+void send_error_response(const runtime *rt,
+                         const char *error_type,
+                         const char *error_message)
+{
+    FATAL(rt == NULL,
+          "send_error_response called with NULL runtime — runtime_init() not called");
+    FATAL(rt->hb->awsRequestId.data == NULL,
+          "send_error_response called without a current request ID — "
+          "call get_next_request() before send_error_response()");
+
+    char path[256];
+    snprintf(path, sizeof(path),
+             "/2018-06-01/runtime/invocation/%.*s/error",
+             (int)rt->hb->awsRequestId.len,
+             rt->hb->awsRequestId.data);
+
+    char body[4096];
+    int body_len = write_error_json(body, (int)sizeof(body),
+                                    error_type, error_message);
+
+    LOG_ERROR_F("invocation error (type=%s): %s", error_type, error_message);
+
+    /*
+     * 30-second timeout — same as the response POST.
+     * The ACK from Lambda is tiny; MAX_HTTP_HEADER_SIZE is more than enough.
+     */
+    http(rt, path, "POST", body, body_len, 30, MAX_HTTP_HEADER_SIZE);
+}
+
+/*
+ * send_init_error — POST error JSON to the init error endpoint.
+ *
+ * Called when lambpie_init() fails, before the event loop starts.
+ * Lambda marks the execution environment as failed.  The caller must
+ * exit() after this call — there is no recovery path.
+ *
+ * This function constructs a temporary runtime so it can reuse the http()
+ * helper.  The runtime_api env var must be set (as it always is inside
+ * Lambda), otherwise we FATAL — which is still better than a silent hang.
+ */
+void send_init_error(const char *error_type,
+                     const char *error_message)
+{
+    LOG_ERROR_F("init error (type=%s): %s", error_type, error_message);
+
+    const char *runtime_api = getenv("AWS_LAMBDA_RUNTIME_API");
+    if (runtime_api == NULL)
+    {
+        /* Can't report back — just die loudly.  The structured log line
+         * above is already on stderr for CloudWatch. */
+        LOG_FATAL("send_init_error: AWS_LAMBDA_RUNTIME_API not set — "
+                  "cannot POST init error to Lambda service");
+        /* LOG_FATAL calls exit(1); this line is unreachable. */
+    }
+
+    /*
+     * Build a minimal throw-away runtime.  We don't call runtime_init()
+     * here because:
+     *   1. runtime_init() allocates 12 MB of mmapped buffers we don't need.
+     *   2. It is idempotent-by-static but we may be on an error path before
+     *      or instead of the normal init, so we avoid side effects.
+     */
+    struct addrinfo *addr = resolve_host(runtime_api);
+
+    /* Small stack buffer for the request body and the response. */
+    static char err_response_buffer[MAX_HTTP_HEADER_SIZE];
+    static http_recv_buffer err_hb;
+    err_hb.buffer.data = err_response_buffer;
+    err_hb.buffer.len  = sizeof(err_response_buffer);
+    err_hb.body.data   = NULL;
+    err_hb.awsRequestId.data = NULL;
+
+    static runtime err_rt;
+    err_rt.hb                = &err_hb;
+    err_rt.runtime_addrinfo  = addr;
+    err_rt.runtime_api       = runtime_api;
+    err_rt.response_buffer   = NULL;
+
+    static const char *path = "/2018-06-01/runtime/init/error";
+
+    char body[4096];
+    int body_len = write_error_json(body, (int)sizeof(body),
+                                    error_type, error_message);
+
+    http(&err_rt, path, "POST", body, body_len, 30, MAX_HTTP_HEADER_SIZE);
+    freeaddrinfo(addr);
 }
 
 /* ---------------------------------------------------------------------------
@@ -295,37 +421,44 @@ static void *mapalloc(size_t size)
 
 runtime *runtime_init(void)
 {
-    /* static: one runtime per process. Lambda processes one invocation at a time. */
+    /* static: one runtime per process (Lambda is single-invocation). */
     static runtime rt;
     static http_recv_buffer hb;
     rt.hb = &hb;
+
+    LOG_INFO("lambpie runtime init start");
 
     rt.runtime_api = getenv("AWS_LAMBDA_RUNTIME_API");
     FATAL(rt.runtime_api == NULL,
           "AWS_LAMBDA_RUNTIME_API environment variable is not set — "
           "this binary must run inside the Lambda execution environment");
-    DEBUG("Runtime API: %s\n", rt.runtime_api);
+
+    LOG_VERBOSE_F("runtime API endpoint: %s", rt.runtime_api);
 
     rt.runtime_addrinfo = resolve_host(rt.runtime_api);
 
-    hb.buffer.data      = mapalloc(INCOMING_LAMBDA_REQUEST_BUFFER_SIZE);
-    rt.response_buffer  = mapalloc(OUTGOING_LAMBDA_RESPONSE_BUFFER_SIZE);
+    hb.buffer.data     = mapalloc(INCOMING_LAMBDA_REQUEST_BUFFER_SIZE);
+    rt.response_buffer = mapalloc(OUTGOING_LAMBDA_RESPONSE_BUFFER_SIZE);
+
+    LOG_INFO("lambpie runtime init complete");
     return &rt;
 }
 
 http_recv_buffer *get_next_request(const runtime *rt)
 {
     static const char *path = "/2018-06-01/runtime/invocation/next";
-    DEBUG("Polling for next invocation\n");
+    LOG_VERBOSE("polling for next invocation");
     /*
      * rcvtimeo_sec = 0: block indefinitely.
      * The /next endpoint long-polls; Lambda may hold the connection open for
-     * many minutes on a warm-but-idle container.  Any finite timeout here
-     * would kill the container between invocations.
+     * many minutes on a warm-but-idle container.  Any finite timeout would
+     * kill the container between invocations.
      */
-    http(rt, path, "GET", "", 0, 0 /* no timeout */);
+    http(rt, path, "GET", "", 0, 0, INCOMING_LAMBDA_REQUEST_BUFFER_SIZE);
     FATAL(rt->hb->awsRequestId.data == NULL,
           "Lambda-Runtime-Aws-Request-Id header missing from /next response");
+    LOG_INFO_F("invocation start: request_id=%.*s",
+               (int)rt->hb->awsRequestId.len, rt->hb->awsRequestId.data);
     return rt->hb;
 }
 
@@ -343,9 +476,17 @@ void send_response(const runtime *rt, const char *response, size_t response_len)
     /*
      * rcvtimeo_sec = 30: give Lambda 30 seconds to ACK the response.
      * Lambda's maximum function timeout is 15 minutes, but the response POST
-     * itself should complete in well under a second on the loopback interface.
+     * itself completes in well under a second on the loopback interface.
      */
-    http(rt, path, "POST", response, (int)response_len, 30 /* seconds */);
+    /*
+     * The ACK response from Lambda is tiny; MAX_HTTP_HEADER_SIZE is enough.
+     * We reuse hb->buffer.data (the 6 MB mmap) since it's already there, but
+     * limit the parse to the header-sized portion.
+     */
+    http(rt, path, "POST", response, (int)response_len, 30, MAX_HTTP_HEADER_SIZE);
+    LOG_INFO_F("invocation complete: request_id=%.*s bytes=%zu",
+               (int)rt->hb->awsRequestId.len, rt->hb->awsRequestId.data,
+               response_len);
 }
 
 void start_lambda(int (*handler)(const http_recv_buffer *, char *))
@@ -357,6 +498,21 @@ void start_lambda(int (*handler)(const http_recv_buffer *, char *))
     {
         http_recv_buffer *hb = get_next_request(rt);
         int lambda_response_length = handler(hb, output_buffer);
-        send_response(rt, output_buffer, (size_t)lambda_response_length);
+
+        if (lambda_response_length < 0)
+        {
+            /*
+             * Negative return: handler signals an error.
+             * Report it to Lambda and continue the event loop —
+             * the execution environment stays alive for the next invocation.
+             */
+            send_error_response(rt,
+                                "Runtime.HandlerError",
+                                "handler returned a negative response length");
+        }
+        else
+        {
+            send_response(rt, output_buffer, (size_t)lambda_response_length);
+        }
     }
 }
