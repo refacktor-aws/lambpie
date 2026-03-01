@@ -50,7 +50,7 @@ pub fn lambda_event_loop(handler_fn: impl Fn(&Event, &mut Writer) -> ()) -> ! {
         loop {
             let request = get_next_request(runtime);
             let event = Event {
-                body: from_raw_parts((*request).body.data, (*request).body.data_len)
+                body: from_raw_parts((*request).body.data, (*request).body.len)
             };
             let mut writer = Writer {
                 buffer: response_buffer,

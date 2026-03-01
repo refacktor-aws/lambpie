@@ -1,14 +1,19 @@
+/* Mirror of the C `slice` struct in runtime.h.
+ * Field order and types must stay in sync with:
+ *   typedef struct { char *data; size_t len; } slice;
+ */
 #[repr(C)]
-pub(crate) struct Data {
+pub(crate) struct Slice {
     pub data: *const u8,
-    pub data_len: usize,
+    pub len: usize,
 }
 
+/* Mirror of `http_recv_buffer` in runtime.h. */
 #[repr(C)]
 pub(crate) struct HttpBuffer {
-    pub buffer: Data,
-    pub aws_request_id: Data,
-    pub body: Data,
+    pub buffer: Slice,
+    pub aws_request_id: Slice,
+    pub body: Slice,
 }
 
 #[repr(C)]

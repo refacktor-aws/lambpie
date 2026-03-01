@@ -23,7 +23,12 @@ void arena_init(arena *a, size_t capacity) {
 }
 
 void *arena_alloc(arena *a, size_t size) {
-    size = (size + 7) & ~7;  // 8-byte align
+    size = (size + 7) & ~7;  /* 8-byte align */
+    if (a->cursor + size > a->limit) {
+        fprintf(stderr, "arena_alloc: arena exhausted (requested %zu bytes, %td available)\n",
+                size, a->limit - a->cursor);
+        exit(1);
+    }
     char *ptr = a->cursor;
     a->cursor += size;
     return ptr;

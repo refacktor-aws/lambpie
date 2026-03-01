@@ -1,12 +1,24 @@
+#ifndef LAMBPIE_RUNTIME_H
+#define LAMBPIE_RUNTIME_H
 
+#include <stddef.h>   /* size_t */
+#include <stdio.h>    /* fprintf */
+#include <stdlib.h>   /* exit   */
+
+/* LOG always writes to stderr — visible in CloudWatch Logs in both debug and release. */
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 
-#ifndef RELEASE
+/* FATAL must be active in ALL builds. A silent no-op in production would allow
+ * corrupted state to continue executing instead of dying immediately.
+ * Never gate this on RELEASE. */
+#define FATAL(COND, MSG) do { if (COND) { fprintf(stderr, "FATAL: " MSG "\n"); exit(1); } } while (0)
+
+/* DEBUG is compiled out in release builds. Gate behind LAMBPIE_DEBUG so it
+ * does not conflict with system-level NDEBUG. */
+#ifdef LAMBPIE_DEBUG
 #define DEBUG(...) fprintf(stderr, __VA_ARGS__)
-#define FATAL(COND, MSG) { if(COND) { LOG(MSG); exit(-1); } }
 #else
-#define DEBUG(...)
-#define FATAL(COND, MSG)
+#define DEBUG(...) ((void)0)
 #endif
 
 #define MAX_REQUEST_SIZE 6 * 1048576
@@ -41,3 +53,5 @@ char *get_response_buffer(const runtime *rt);
 http_recv_buffer* get_next_request(const runtime *rt);
 
 void send_response(const runtime *rt, const char *response_buffer, size_t response_len);
+
+#endif /* LAMBPIE_RUNTIME_H */
