@@ -1,5 +1,5 @@
 #![no_std]
-pub(crate) mod bindings;
+pub mod bindings;
 pub mod api;
 
 use core::panic::PanicInfo;

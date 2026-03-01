@@ -5,6 +5,7 @@ fn main() {
     let mut build = cc::Build::new();
 
     build.file("../src/runtime.c")
+        .file("../src/arena.c")
         .std("c17");
 
     if profile == "release" {
@@ -16,5 +17,6 @@ fn main() {
         .compile("aws_lambda_libc");
 
     println!("cargo:rerun-if-changed=../src/runtime.c");
+    println!("cargo:rerun-if-changed=../src/arena.c");
     println!("cargo:rustc-link-lib=dylib=c");
 }

@@ -59,8 +59,8 @@ if __name__ == '__main__':
     # Verify global handler pointer
     assert '@"lambpie_handler"' in llvm_ir, "global handler pointer not found"
 
-    # Verify malloc is called in init (for Handler allocation)
-    assert "malloc" in llvm_ir, "malloc not found"
+    # Verify arena allocator is used (not malloc) for Handler
+    assert "lambpie_arena_alloc" in llvm_ir, "arena allocator not found"
 
     print("\n--- Test: test_echo_handler ---")
     print(llvm_ir)
@@ -109,3 +109,97 @@ if __name__ == '__main__':
     assert "loop.exit" in llvm_ir
     print("\n--- Test: test_handler_with_loop ---")
     print(llvm_ir)
+
+
+def test_arena_static_tag_in_init():
+    """Handler allocated in lambpie_init uses static arena (tag 0)."""
+    code = """
+class Handler:
+    def init(self) -> None:
+        pass
+
+    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
+        return 0
+
+if __name__ == '__main__':
+    app: Handler = Handler()
+"""
+    llvm_ir = compile_lambpie_code(code)
+    # lambpie_init should use arena tag 0 (STATIC)
+    assert 'call i8* @"lambpie_arena_alloc"(i32 0,' in llvm_ir, \
+        "lambpie_init should allocate Handler on static arena (tag 0)"
+
+
+def test_arena_req_tag_in_handle():
+    """Objects constructed inside handle() use request arena (tag 1)."""
+    code = """
+class Temp:
+    val: int
+
+    def __init__(self, v: int) -> None:
+        pass
+
+class Handler:
+    def init(self) -> None:
+        pass
+
+    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
+        t: Temp = Temp(42)
+        return 0
+
+if __name__ == '__main__':
+    app: Handler = Handler()
+"""
+    llvm_ir = compile_lambpie_code(code)
+    # Inside Handler_handle, Temp() should use arena tag 1 (REQ)
+    # Find the Handler_handle function and check for tag 1
+    handle_start = llvm_ir.index('@"Handler_handle"')
+    handle_ir = llvm_ir[handle_start:]
+    assert 'call i8* @"lambpie_arena_alloc"(i32 1,' in handle_ir, \
+        "Handler.handle should allocate Temp on request arena (tag 1)"
+
+
+def test_arena_static_tag_in_handler_init():
+    """Objects constructed inside Handler.init() use static arena (tag 0)."""
+    code = """
+class Config:
+    val: int
+
+    def __init__(self, v: int) -> None:
+        pass
+
+class Handler:
+    def init(self) -> None:
+        c: Config = Config(99)
+
+    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
+        return 0
+
+if __name__ == '__main__':
+    app: Handler = Handler()
+"""
+    llvm_ir = compile_lambpie_code(code)
+    # Inside Handler_init, Config() should use arena tag 0 (STATIC)
+    init_start = llvm_ir.index('@"Handler_init"')
+    init_end = llvm_ir.index('@"Handler_handle"')
+    init_ir = llvm_ir[init_start:init_end]
+    assert 'call i8* @"lambpie_arena_alloc"(i32 0,' in init_ir, \
+        "Handler.init should allocate Config on static arena (tag 0)"
+
+
+def test_target_triple():
+    """Default target triple should be x86_64-unknown-linux-gnu."""
+    code = """
+class Handler:
+    def init(self) -> None:
+        pass
+
+    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
+        return 0
+
+if __name__ == '__main__':
+    app: Handler = Handler()
+"""
+    llvm_ir = compile_lambpie_code(code)
+    assert 'target triple = "x86_64-unknown-linux-gnu"' in llvm_ir, \
+        "Default target should be Lambda triple"

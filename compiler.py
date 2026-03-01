@@ -52,7 +52,7 @@ class Compiler(ast.NodeVisitor):
 
         self.global_scope['__name__'] = main_global_var.gep([ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
 
-        # Pre-declare malloc for consistency
+        # Pre-declare malloc (kept for builtins compatibility)
         malloc_type = ir.FunctionType(ir.IntType(8).as_pointer(), [ir.IntType(64)])
         self.global_scope['malloc'] = ir.Function(self.module, malloc_type, name='malloc')
 
@@ -61,6 +61,25 @@ class Compiler(ast.NodeVisitor):
                                       [ir.IntType(8).as_pointer(), ir.IntType(8).as_pointer(), ir.IntType(64)])
         if 'memcpy' not in self.global_scope:
             self.global_scope['memcpy'] = ir.Function(self.module, memcpy_type, name='memcpy')
+
+        # Arena allocator: lambpie_arena_alloc(tag: i32, size: i64) -> i8*
+        arena_alloc_type = ir.FunctionType(
+            ir.IntType(8).as_pointer(),
+            [ir.IntType(32), ir.IntType(64)])
+        self.global_scope['lambpie_arena_alloc'] = ir.Function(
+            self.module, arena_alloc_type, name='lambpie_arena_alloc')
+
+        # Arena tag constants
+        self.ARENA_STATIC = 0
+        self.ARENA_REQ = 1
+
+        # Current arena context: which arena to allocate from
+        # Set to STATIC during init(), REQ during handle()
+        self.current_arena = self.ARENA_STATIC
+
+        # Arena tags per variable: tracks which arena a value was allocated from
+        # Maps variable name -> arena tag (ARENA_STATIC or ARENA_REQ)
+        self.arena_tags = {}
 
     def _get_type(self, annotation_node):
         if isinstance(annotation_node, ast.Name):
@@ -155,6 +174,15 @@ class Compiler(ast.NodeVisitor):
 
         print(f"Found function/method: {func_name}")
 
+        # Set arena context based on which Handler method we're compiling
+        saved_arena = self.current_arena
+        if class_name == 'Handler':
+            if node.name == 'handle':
+                self.current_arena = self.ARENA_REQ
+            else:
+                # __init__, init, and any other Handler methods use static arena
+                self.current_arena = self.ARENA_STATIC
+
         return_type = self._get_type(node.returns)
 
         arg_types = []
@@ -175,6 +203,7 @@ class Compiler(ast.NodeVisitor):
         self.builder = ir.IRBuilder(entry_block)
 
         self.local_scope = {}
+        self.arena_tags = {}
 
         ast_args = [arg for arg in node.args.args if arg.arg != 'self']
 
@@ -194,10 +223,13 @@ class Compiler(ast.NodeVisitor):
             self.visit(stmt)
 
         if not self.builder.block.is_terminated:
-            if str(return_type) != 'void':
+            if return_type != ir.VoidType():
                 self.builder.unreachable()
             else:
                 self.builder.ret_void()
+
+        # Restore arena context
+        self.current_arena = saved_arena
 
     def visit_Return(self, node):
         if node.value:
@@ -373,8 +405,10 @@ class Compiler(ast.NodeVisitor):
             size_ptr = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)], inbounds=False)
             size = self.builder.ptrtoint(size_ptr, self.types['int'], name="size")
 
-            malloc_func = self.global_scope['malloc']
-            obj_ptr_void = self.builder.call(malloc_func, [size], 'malloc_call')
+            # Use arena allocator with current arena tag
+            arena_alloc = self.global_scope['lambpie_arena_alloc']
+            tag = ir.Constant(ir.IntType(32), self.current_arena)
+            obj_ptr_void = self.builder.call(arena_alloc, [tag, size], 'arena_call')
             obj_ptr = self.builder.bitcast(obj_ptr_void, callee, 'obj_ptr')
 
             init_name = f"{obj_type.name}___init__"
@@ -406,6 +440,9 @@ class Compiler(ast.NodeVisitor):
         if node.value:
             value = self.visit(node.value)
             self.builder.store(value, var_alloc)
+
+        # Tag variable with current arena context
+        self.arena_tags[var_name] = self.current_arena
 
     def visit_Assign(self, node):
         var_name = node.targets[0].id
@@ -458,8 +495,10 @@ class Compiler(ast.NodeVisitor):
         size_ptr = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)], inbounds=False)
         size = self.builder.ptrtoint(size_ptr, self.types['int'], name='size')
 
-        malloc_func = self.global_scope['malloc']
-        obj_ptr_void = self.builder.call(malloc_func, [size], 'malloc_call')
+        # Allocate Handler on static arena (cold-start)
+        arena_alloc = self.global_scope['lambpie_arena_alloc']
+        tag = ir.Constant(ir.IntType(32), self.ARENA_STATIC)
+        obj_ptr_void = self.builder.call(arena_alloc, [tag, size], 'arena_call')
         handler_instance = self.builder.bitcast(obj_ptr_void, handler_ptr_type, 'handler')
 
         # Call Handler.__init__ if it exists
