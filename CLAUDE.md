@@ -41,20 +41,27 @@ class Handler:
         return 0                   # returns response length
 ```
 
+## Memory Model (Dual-Arena)
+
+- **Static arena** (tag 0): allocations in `__init__`/`init()`, persists across invocations, frozen after init via mprotect
+- **Request arena** (tag 1): allocations in `handle()`, bulk-reset after each invocation
+- Forward-pointer protection is provided by mprotect (static arena read-only = runtime SIGSEGV on write)
+
 ## Key Decisions
 
 - TLS: dynamic-link OpenSSL from AL2023 (zero binary cost)
-- SigV4: pure Rust SHA-256 (no OpenSSL for crypto)
+- SigV4: implement in .pie (pure integer math — SHA-256 is 32-bit rotations/XORs)
+- SDK models: parse botocore JSON models (not Smithy)
 - Compiler stays in Python (no self-hosting)
 - Cross-compile target: x86_64-unknown-linux-gnu
 - Deploy via boto3, not awscli
 
-## Specialist Domains
+## Subagents
 
-When working on this project, these are the 5 specialist areas:
+Specialist agents are defined in `.claude/agents/`. They are auto-loaded by Claude Code:
 
-1. **Compiler/LLVM IR** — compiler.py, builtins.pie, type system, AST visitors, codegen
-2. **Rust Runtime** — runtime/rust-binding/, runtime/shim/, no_std FFI, Writer API
-3. **C Runtime** — runtime/src/, HTTP protocol, socket handling, Lambda API
-4. **AWS Integration** — scripts/deploy.py, SigV4, Smithy codegen, boto3 shims
-5. **Build Toolchain** — scripts/build.py, cross-compilation, llc, cargo, Docker
+1. **compiler-specialist** — compiler.py, builtins.pie, type system, AST visitors, codegen
+2. **rust-runtime** — runtime/rust-binding/, runtime/shim/, no_std FFI, Writer API
+3. **c-runtime** — runtime/src/, HTTP protocol, arena allocator, Lambda API
+4. **aws-integration** — scripts/deploy.py, SigV4, botocore models, boto3 shims
+5. **build-toolchain** — scripts/build.py, cross-compilation, llc, cargo, Docker
