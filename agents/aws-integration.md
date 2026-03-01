@@ -28,7 +28,8 @@ Mock Lambda testing (tests/test_runtime.py):
 - Runs bootstrap binary as subprocess with AWS_LAMBDA_RUNTIME_API=localhost:8080
 
 SigV4 signing (M4 plan):
-- Decision: pure Rust SHA-256 (no OpenSSL for crypto)
+- Decision: implement in .pie (pure integer math, valid Python too)
+- SHA-256 is just 32-bit rotations/XORs — all ops the compiler supports
 - Reference: AWS Java SDK v2 signer
 - Four steps:
   1. Create canonical request (method, path, query, headers, payload hash)

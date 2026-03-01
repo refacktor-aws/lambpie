@@ -4,7 +4,10 @@ import os
 from llvmlite import ir, binding
 
 class Compiler(ast.NodeVisitor):
-    def __init__(self, module_name="lambpie_module"):
+    LAMBDA_TRIPLE = 'x86_64-unknown-linux-gnu'
+    LAMBDA_DATA_LAYOUT = 'e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128'
+
+    def __init__(self, module_name="lambpie_module", target_triple=None):
         # LLVM setup
         self.binding = binding
         self.binding.initialize()
@@ -13,10 +16,16 @@ class Compiler(ast.NodeVisitor):
 
         self.context = ir.Context()
         self.module = ir.Module(name=module_name, context=self.context)
-        self.module.triple = self.binding.get_default_triple()
-        target = self.binding.Target.from_default_triple()
-        target_machine = target.create_target_machine()
-        self.module.data_layout = target_machine.target_data
+
+        # Default to Lambda target triple, override with explicit arg
+        triple = target_triple or self.LAMBDA_TRIPLE
+        self.module.triple = triple
+        if triple == self.LAMBDA_TRIPLE:
+            self.module.data_layout = self.LAMBDA_DATA_LAYOUT
+        else:
+            target = self.binding.Target.from_triple(triple)
+            target_machine = target.create_target_machine()
+            self.module.data_layout = target_machine.target_data
 
         # Type definitions
         self.types = {
@@ -524,6 +533,8 @@ def main():
     parser.add_argument('source_file', help="The source .pie file to compile.")
     parser.add_argument('-o', '--output', dest='output_name', default='handler',
                         help="The base name for the output files (default: handler).")
+    parser.add_argument('--target', dest='target_triple', default=None,
+                        help="Target triple (default: x86_64-unknown-linux-gnu).")
 
     args = parser.parse_args()
 
@@ -552,7 +563,7 @@ def main():
     )
 
     # 4. Compile
-    compiler = Compiler()
+    compiler = Compiler(target_triple=args.target_triple)
     llvm_module = compiler.compile(combined_ast)
 
     print("\n--- LLVM IR ---")
