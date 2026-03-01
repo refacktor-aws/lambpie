@@ -241,22 +241,139 @@ tree-sitter as a fallback. Session suspended, this origin story written.
 
 ---
 
+## Session 3.5: End-to-End Build Pipeline (same day)
+
+The Docker multi-stage build and localstack verification pipeline were created:
+
+- **`Dockerfile.build`** — Multi-stage: amazonlinux:2023 + llvmlite + LLVM 15 +
+  Rust stable. Compiles `.pie` to LLVM IR, assembles to `.o`, links via cargo
+  into the final `bootstrap` binary (8.5 KB ELF, dynamically linked).
+- **`docker-compose.yml`** — localstack:3.0 on port 4577 (avoiding conflict with
+  other projects on 4566).
+- **`Makefile`** — orchestrates `test`, `build`, `package`, `verify`, `clean`.
+- **`scripts/package.py`** — zips bootstrap with executable permissions.
+- **`scripts/verify.py`** — boto3 deploys to localstack, invokes echo handler,
+  asserts exact JSON match.
+
+Bug fixes: `arena.c` needed `#define _GNU_SOURCE` and `#include <unistd.h>` for
+MAP_ANONYMOUS/MAP_NORESERVE/getpagesize(). Lambda functions need a wait loop for
+Active state before invoke (localstack creates in Pending state).
+
+Docker build is fully cached after first run — sub-second rebuilds if only `.pie`
+files change. **Milestone 3 done:** `make verify` passes end-to-end.
+
+---
+
+## Session 4: Flat Module Model + Typed Events (same day)
+
+The user's feedback evolved across four messages, each one sharpening the design:
+
+1. **Drop `class Handler`** — *"just have init code followed by def handle!"*
+2. **Strongly typed events** — `class Request` with typed fields, not loose `dict`
+3. **Compiler-generated JSON marshaling** — user never sees pointers
+4. **Metadata for deployment** — compiler emits trigger type info
+
+### The Problem
+
+The existing handler API was unusable for real work — raw `__ptr__` pointers,
+manual `memcpy`, C-level buffer management:
+
+```python
+# Old: raw pointers, manual buffer copy
+class Handler:
+    def handle(self, event_ptr: __ptr__, event_len: int,
+               response_ptr: __ptr__, response_cap: int) -> int:
+        memcpy(response_ptr, event_ptr, event_len)
+        return event_len
+```
+
+### The New Design
+
+```python
+# New: typed events, compiler-generated JSON marshaling
+class Request:
+    message: str
+    number: int
+
+class Response:
+    status: str
+    echo: str
+    doubled: int
+
+def handle(event: Request) -> Response:
+    return Response("ok", event.message, event.number + event.number)
+```
+
+The runtime FFI contract is unchanged — `lambpie_handle(event_ptr, event_len,
+response_ptr, response_cap) -> i64` still receives and returns raw bytes. But
+now the *compiler* generates the JSON parsing/serialization glue, so the user
+never touches pointers.
+
+### Implementation (8 Phases)
+
+**Phase 1: C Runtime JSON helpers** — `json.h`/`json.c` with minimal,
+non-allocating JSON parse/serialize for flat objects. Zero-copy string extraction,
+integer parsing, and position-based serialization (`json_open`, `json_write_str`,
+`json_write_int`, `json_close`).
+
+**Phase 2: Field access** — `visit_Attribute` gained a field access fallback:
+try method lookup first (existing), then GEP + load for struct fields. This
+enables `event.message`, `event.number`.
+
+**Phase 3: Auto-generated `__init__`** — If a class has annotated fields but no
+explicit `__init__`, the compiler generates one taking positional args in field
+order. This enables `Response("ok", event.message, 42)`.
+
+**Phase 4: String literal coercion** — When constructing a class, if a field
+expects `%str*` but the argument is `i8*` (a string literal), the compiler
+automatically wraps it: allocates a `str` struct, sets buffer pointer and length.
+This enables `Response("ok", ...)` without manual wrapping.
+
+**Phase 5: Flat module model** — `visit_Module` rewritten: `ClassDef` and
+`ImportFrom` are visited immediately for type registration. `def handle` is
+deferred. Top-level statements become `lambpie_init()` body. No more
+`class Handler` requirement.
+
+**Phase 6: Rewrite `_synthesize_lambda_entry`** — Complete rewrite. `lambpie_init`
+compiles collected init statements. `lambpie_handle` deserializes event JSON into
+a typed struct (using the C JSON helpers), calls the user's `handle()` function,
+and serializes the response struct back to JSON. Also emits metadata
+(`target/<name>.lambpie.json`) with trigger type info — the extension point for
+future AWS event types.
+
+**Phase 7: Tests** — All tests rewritten for the new model. `echo.pie` becomes
+the typed handler above. `verify.py` expects
+`{"status":"ok","echo":"hello from lambpie","doubled":84}`.
+
+**Phase 8: Documentation** — This section. CLAUDE.md updated.
+
+### Decisions Locked In
+
+| Decision | Choice |
+|----------|--------|
+| Handler model | Flat module: top-level `def handle(event: T) -> R` |
+| Event types | User-defined classes with typed fields |
+| JSON marshaling | Compiler-generated, using C runtime helpers |
+| Metadata | `.lambpie.json` alongside `.ll` — trigger type for deploy |
+| Extension point | Future: `SQSEvent`, `APIGatewayEvent` as known types |
+
+---
+
 ## What Exists Today
 
 **Done:**
 - M1: Lambda echo handler compiles to LLVM IR, all tests pass
 - M2: Dual-arena bump allocator with mprotect freeze, all tests pass
+- M3: End-to-end build pipeline with Docker, `make verify` passes
+- M4: Flat module model with typed events and compiler-generated JSON marshaling
 - Specialist agent definitions in `.claude/agents/`
 - Coding standards in CLAUDE.md
 
-**In Progress:**
-- C signatures YAML pipeline (Docker preprocessing works, parser needs fixing)
-
 **TODO:**
-- M3: Typed structs & JSON serialization
-- M4: Raw HTTP + SigV4 signing (pure Rust SHA-256, dynlink OpenSSL for TLS)
-- M5: AWS SDK modules from botocore JSON models
-- M6: Python compatibility package
+- Raw HTTP + SigV4 signing (pure Rust SHA-256, dynlink OpenSSL for TLS)
+- AWS SDK modules from botocore JSON models
+- Python compatibility package (`escape.py`)
+- C signatures YAML pipeline (Docker preprocessing works, parser needs fixing)
 
 ---
 

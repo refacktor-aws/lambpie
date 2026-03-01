@@ -1,12 +1,11 @@
-from C import memcpy
+class Request:
+    message: str
+    number: int
 
-class Handler:
-    def init(self) -> None:
-        pass
+class Response:
+    status: str
+    echo: str
+    doubled: int
 
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        memcpy(response_ptr, event_ptr, event_len)
-        return event_len
-
-if __name__ == '__main__':
-    app: Handler = Handler()
+def handle(event: Request) -> Response:
+    return Response("ok", event.message, event.number + event.number)

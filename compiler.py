@@ -1,4 +1,5 @@
 import ast
+import json
 import sys
 import os
 from llvmlite import ir, binding
@@ -84,6 +85,10 @@ class Compiler(ast.NodeVisitor):
         # Monotonic counter for collision-free global names
         self._name_counter = 0
 
+        # Flat module model: deferred handle function and init statements
+        self._handle_node = None
+        self._init_stmts = []
+
     def _get_type(self, annotation_node):
         if isinstance(annotation_node, ast.Name):
             type_name = annotation_node.id
@@ -91,8 +96,13 @@ class Compiler(ast.NodeVisitor):
                 return self.types['__ptr__']
             if type_name in self.types:
                 return self.types[type_name]
-            else:
-                raise TypeError(f"Unknown type: {type_name}")
+            # Check if it's a known class name (registered in class_layouts)
+            if type_name in self.class_layouts:
+                # Register pointer type lazily
+                struct_type = self.module.context.get_identified_type(type_name)
+                self.types[type_name] = struct_type.as_pointer()
+                return self.types[type_name]
+            raise TypeError(f"Unknown type: {type_name}")
 
         elif isinstance(annotation_node, ast.Constant) and annotation_node.value is None:
             return self.types['None']
@@ -111,6 +121,7 @@ class Compiler(ast.NodeVisitor):
 
     def visit_Module(self, node):
         for sub_node in node.body:
+            # Skip if __name__ == '__main__' blocks
             is_main_block = (
                 isinstance(sub_node, ast.If) and
                 isinstance(sub_node.test, ast.Compare) and
@@ -122,7 +133,22 @@ class Compiler(ast.NodeVisitor):
                 isinstance(sub_node.test.comparators[0], ast.Constant) and
                 sub_node.test.comparators[0].value == '__main__'
             )
-            if not is_main_block:
+            if is_main_block:
+                continue
+
+            # ClassDef, ImportFrom → visit immediately (type registration)
+            if isinstance(sub_node, (ast.ClassDef, ast.ImportFrom)):
+                self.visit(sub_node)
+            # Top-level handle() → defer compilation
+            elif isinstance(sub_node, ast.FunctionDef) and sub_node.name == 'handle':
+                self._handle_node = sub_node
+            # Other FunctionDef → visit immediately
+            elif isinstance(sub_node, ast.FunctionDef):
+                self.visit(sub_node)
+            # Top-level statements → collect for lambpie_init
+            elif isinstance(sub_node, (ast.AnnAssign, ast.Assign, ast.Expr)):
+                self._init_stmts.append(sub_node)
+            else:
                 self.visit(sub_node)
 
     def visit_ImportFrom(self, node):
@@ -168,23 +194,143 @@ class Compiler(ast.NodeVisitor):
         self.types[class_name] = class_type.as_pointer()
         self.class_layouts[class_name] = attributes
 
+        # Check if class has an explicit __init__
+        has_init = any(
+            isinstance(stmt, ast.FunctionDef) and stmt.name == '__init__'
+            for stmt in node.body
+        )
+
+        # Auto-generate __init__ if none exists
+        if not has_init:
+            self._generate_auto_init(class_name, class_type, attributes)
+
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
                 self.visit_FunctionDef(stmt, class_name=class_name)
+
+    def _is_str_type(self, llvm_type):
+        """Check if an LLVM type is a pointer to the str struct."""
+        if not isinstance(llvm_type, ir.PointerType):
+            return False
+        if not isinstance(llvm_type.pointee, ir.IdentifiedStructType):
+            return False
+        return llvm_type.pointee.name == 'str'
+
+    def _wrap_cstr_to_str(self, i8_ptr):
+        """Wrap an i8* (C string literal) into a %str* struct on current arena."""
+        str_ptr_type = self.types['str']
+
+        # Compute size of str struct
+        null_ptr = ir.Constant(str_ptr_type, None)
+        size_ptr = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)], inbounds=False)
+        size = self.builder.ptrtoint(size_ptr, self.types['int'], name='str.size')
+
+        # Allocate on current arena
+        arena_alloc = self.global_scope['lambpie_arena_alloc']
+        tag = ir.Constant(ir.IntType(32), self.current_arena)
+        raw = self.builder.call(arena_alloc, [tag, size], 'str.raw')
+        str_ptr = self.builder.bitcast(raw, str_ptr_type, 'str.ptr')
+
+        # Get str struct layout: {i32 ref_count, i64 len, i8* buffer}
+        layout = self.class_layouts['str']
+
+        # Set ref_count = 1
+        ref_idx = layout['__ref_count__'][0]
+        ref_ptr = self.builder.gep(str_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), ref_idx)],
+            inbounds=True, name='str.rc.ptr')
+        self.builder.store(ir.Constant(ir.IntType(32), 1), ref_ptr)
+
+        # Compute strlen
+        strlen_fn = self.global_scope['strlen']
+        length = self.builder.call(strlen_fn, [i8_ptr], 'str.len')
+
+        # Set len field
+        len_idx = layout['len'][0]
+        len_ptr = self.builder.gep(str_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), len_idx)],
+            inbounds=True, name='str.len.ptr')
+        self.builder.store(length, len_ptr)
+
+        # Set buffer field
+        buf_idx = layout['buffer'][0]
+        buf_ptr = self.builder.gep(str_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), buf_idx)],
+            inbounds=True, name='str.buf.ptr')
+        self.builder.store(i8_ptr, buf_ptr)
+
+        return str_ptr
+
+    def _coerce_arg(self, value, expected_type):
+        """Coerce a value to the expected type if needed (e.g., i8* -> %str*)."""
+        if self._is_str_type(expected_type):
+            # Check if value is i8* (string literal pointer)
+            if isinstance(value.type, ir.PointerType) and isinstance(value.type.pointee, ir.IntType) and value.type.pointee.width == 8:
+                return self._wrap_cstr_to_str(value)
+        return value
+
+    def _generate_auto_init(self, class_name, class_type, attributes):
+        """Generate __init__(self, field1, field2, ...) for a class without explicit __init__."""
+        # Collect fields in order (skip __ref_count__)
+        fields = [(name, idx, typ) for name, (idx, typ) in attributes.items()
+                  if name != '__ref_count__']
+        fields.sort(key=lambda f: f[1])  # sort by field index
+
+        # Build function type: (self_ptr, field1_type, field2_type, ...) -> void
+        self_ptr_type = class_type.as_pointer()
+        arg_types = [self_ptr_type] + [typ for _, _, typ in fields]
+        func_type = ir.FunctionType(ir.VoidType(), arg_types)
+
+        func_name = f"{class_name}___init__"
+        llvm_func = ir.Function(self.module, func_type, name=func_name)
+        self.global_scope[func_name] = llvm_func
+
+        # Save/restore builder context
+        saved_builder = self.builder
+        saved_local = self.local_scope
+
+        entry = llvm_func.append_basic_block(name="entry")
+        self.builder = ir.IRBuilder(entry)
+        self.local_scope = {}
+
+        # Name args and store self
+        llvm_func.args[0].name = 'self'
+        self_alloc = self.builder.alloca(self_ptr_type, name='self')
+        self.builder.store(llvm_func.args[0], self_alloc)
+        self_ptr = self.builder.load(self_alloc, name='self.val')
+
+        # Set __ref_count__ = 1
+        ref_idx = attributes['__ref_count__'][0]
+        ref_ptr = self.builder.gep(self_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), ref_idx)],
+            inbounds=True, name='ref_count.ptr')
+        self.builder.store(ir.Constant(ir.IntType(32), 1), ref_ptr)
+
+        # Store each field from the corresponding arg
+        for i, (field_name, field_idx, field_type) in enumerate(fields):
+            arg = llvm_func.args[i + 1]  # +1 for self
+            arg.name = field_name
+            field_ptr = self.builder.gep(self_ptr,
+                [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)],
+                inbounds=True, name=f'{field_name}.ptr')
+            self.builder.store(arg, field_ptr)
+
+        self.builder.ret_void()
+
+        # Restore context
+        self.builder = saved_builder
+        self.local_scope = saved_local
 
     def visit_FunctionDef(self, node, class_name=None):
         func_name = node.name
         if class_name:
             func_name = f"{class_name}_{func_name}"
 
-        # Set arena context based on which Handler method we're compiling
+        # Set arena context
         saved_arena = self.current_arena
-        if class_name == 'Handler':
-            if node.name == 'handle':
-                self.current_arena = self.ARENA_REQ
-            else:
-                # __init__, init, and any other Handler methods use static arena
-                self.current_arena = self.ARENA_STATIC
+        if not class_name and node.name == 'handle':
+            # Top-level handle() uses request arena
+            self.current_arena = self.ARENA_REQ
 
         return_type = self._get_type(node.returns)
 
@@ -376,14 +522,25 @@ class Compiler(ast.NodeVisitor):
         obj_ptr = self.visit(node.value)
         obj_type_name = obj_ptr.type.pointee.name
 
-        method_name = node.attr
-        mangled_name = f"{obj_type_name}_{method_name}"
+        attr_name = node.attr
+        mangled_name = f"{obj_type_name}_{attr_name}"
 
+        # 1. Try method lookup
         if mangled_name in self.global_scope:
             method_func = self.global_scope[mangled_name]
             return obj_ptr, method_func
-        else:
-            raise NameError(f"Method '{method_name}' not found on object of type '{obj_type_name}'")
+
+        # 2. Try field access via GEP + load
+        if obj_type_name in self.class_layouts:
+            layout = self.class_layouts[obj_type_name]
+            if attr_name in layout:
+                field_index, field_type = layout[attr_name]
+                field_ptr = self.builder.gep(obj_ptr,
+                    [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)],
+                    inbounds=True, name=f"{attr_name}.ptr")
+                return self.builder.load(field_ptr, name=attr_name)
+
+        raise NameError(f"Attribute '{attr_name}' not found on type '{obj_type_name}'")
 
     def visit_Subscript(self, node):
         ptr = self.visit(node.value)
@@ -419,7 +576,15 @@ class Compiler(ast.NodeVisitor):
             init_name = f"{obj_type.name}___init__"
             if init_name in self.global_scope:
                 init_func = self.global_scope[init_name]
-                init_args = [obj_ptr] + [self.visit(arg) for arg in node.args]
+                raw_args = [self.visit(arg) for arg in node.args]
+                # Coerce args to match __init__ parameter types
+                # __init__ params: [self_ptr, field1_type, field2_type, ...]
+                init_param_types = init_func.type.pointee.args
+                coerced_args = []
+                for i, arg in enumerate(raw_args):
+                    expected = init_param_types[i + 1]  # +1 to skip self
+                    coerced_args.append(self._coerce_arg(arg, expected))
+                init_args = [obj_ptr] + coerced_args
                 self.builder.call(init_func, init_args)
 
             return obj_ptr
@@ -464,28 +629,98 @@ class Compiler(ast.NodeVisitor):
         self._synthesize_lambda_entry(tree)
         return self.module
 
+    def get_metadata(self):
+        """Return metadata dict describing the compiled handler."""
+        if self._handle_node is None:
+            return None
+        handle_node = self._handle_node
+        event_type_name = handle_node.args.args[0].annotation.id
+        response_type_name = handle_node.returns.id
+
+        def _fields_dict(layout):
+            result = {}
+            for name, (idx, typ) in layout.items():
+                if name == '__ref_count__':
+                    continue
+                if self._is_str_type(typ):
+                    result[name] = 'str'
+                elif typ == self.types['int']:
+                    result[name] = 'int'
+                else:
+                    result[name] = str(typ)
+            return result
+
+        return {
+            "trigger": "direct",
+            "event_type": event_type_name,
+            "response_type": response_type_name,
+            "event_fields": _fields_dict(self.class_layouts[event_type_name]),
+            "response_fields": _fields_dict(self.class_layouts[response_type_name]),
+        }
+
     def _synthesize_lambda_entry(self, tree):
         """Synthesize lambpie_init() and lambpie_handle() as extern "C" functions.
 
-        lambpie_init: Instantiates Handler, calls Handler.init(), stores in global.
-        lambpie_handle(event_ptr, event_len, response_ptr, response_cap) -> response_len:
-            Calls Handler.handle(event_ptr, event_len) which returns (ptr, len),
-            copies result to response buffer, returns length.
-
-        For M1 (echo handler), handle() receives raw event bytes as __ptr__ + len
-        and returns raw response bytes as __ptr__ (pointing to response buffer).
+        Flat module model:
+        - lambpie_init: compiles collected top-level init statements
+        - lambpie_handle: deserializes event JSON → typed struct, calls handle(),
+          serializes response struct → JSON, returns length
         """
-        # Verify Handler class exists
-        if 'Handler' not in self.types:
-            raise RuntimeError("No Handler class found. Every .pie file must define a Handler class.")
+        if self._handle_node is None:
+            raise RuntimeError("No handle() function found. Every .pie file must define a top-level handle() function.")
 
-        handler_ptr_type = self.types['Handler']
-        handler_struct_type = handler_ptr_type.pointee
+        # Extract event and response type names from handle() annotations
+        handle_node = self._handle_node
+        if not handle_node.args.args or not handle_node.args.args[0].annotation:
+            raise RuntimeError("handle() must have a typed event parameter, e.g. def handle(event: Request) -> Response")
+        if not handle_node.returns:
+            raise RuntimeError("handle() must have a return type annotation, e.g. def handle(event: Request) -> Response")
 
-        # --- Create global to hold the Handler instance ---
-        handler_global = ir.GlobalVariable(self.module, handler_ptr_type, name='lambpie_handler')
-        handler_global.linkage = 'internal'
-        handler_global.initializer = ir.Constant(handler_ptr_type, None)
+        event_type_name = handle_node.args.args[0].annotation.id
+        response_type_name = handle_node.returns.id
+
+        if event_type_name not in self.class_layouts:
+            raise RuntimeError(f"Event type '{event_type_name}' not defined. Define it as a class with typed fields.")
+        if response_type_name not in self.class_layouts:
+            raise RuntimeError(f"Response type '{response_type_name}' not defined. Define it as a class with typed fields.")
+
+        event_layout = self.class_layouts[event_type_name]
+        response_layout = self.class_layouts[response_type_name]
+        event_ptr_type = self.types[event_type_name]
+        response_ptr_type = self.types[response_type_name]
+
+        i8_ptr = self.types['__ptr__']
+        i64 = self.types['int']
+        i32 = ir.IntType(32)
+
+        # --- Compile handle() function first (so it's available for calling) ---
+        self.visit_FunctionDef(handle_node)
+
+        # --- Declare JSON C functions ---
+        # json_get_str(json, json_len, key, key_len, *out_len) -> char*
+        size_t_ptr = ir.PointerType(i64)
+        json_get_str_type = ir.FunctionType(i8_ptr, [i8_ptr, i64, i8_ptr, i64, size_t_ptr])
+        json_get_str = ir.Function(self.module, json_get_str_type, name='json_get_str')
+
+        # json_get_int(json, json_len, key, key_len) -> int64_t
+        json_get_int_type = ir.FunctionType(i64, [i8_ptr, i64, i8_ptr, i64])
+        json_get_int = ir.Function(self.module, json_get_int_type, name='json_get_int')
+
+        # json_open(buf, pos) -> pos
+        json_open_type = ir.FunctionType(i64, [i8_ptr, i64])
+        json_open = ir.Function(self.module, json_open_type, name='json_open')
+
+        # json_write_str(buf, pos, key, key_len, val, val_len) -> pos
+        json_write_str_type = ir.FunctionType(i64, [i8_ptr, i64, i8_ptr, i64, i8_ptr, i64])
+        json_write_str = ir.Function(self.module, json_write_str_type, name='json_write_str')
+
+        # json_write_int(buf, pos, key, key_len, val) -> pos
+        json_write_int_type = ir.FunctionType(i64, [i8_ptr, i64, i8_ptr, i64, i64])
+        json_write_int = ir.Function(self.module, json_write_int_type, name='json_write_int')
+
+        # json_close(buf, pos) -> pos
+        json_close_type = ir.FunctionType(i64, [i8_ptr, i64])
+        json_close = ir.Function(self.module, json_close_type, name='json_close')
 
         # --- lambpie_init() ---
         init_func_type = ir.FunctionType(ir.VoidType(), [])
@@ -493,39 +728,18 @@ class Compiler(ast.NodeVisitor):
         entry = init_func.append_basic_block(name='entry')
         self.builder = ir.IRBuilder(entry)
         self.local_scope = {}
+        self.current_arena = self.ARENA_STATIC
 
-        # Allocate Handler instance
-        null_ptr = ir.Constant(handler_ptr_type, None)
-        size_ptr = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)], inbounds=False)
-        size = self.builder.ptrtoint(size_ptr, self.types['int'], name='size')
+        # Compile collected init statements
+        for stmt in self._init_stmts:
+            self.visit(stmt)
 
-        # Allocate Handler on static arena (cold-start)
-        arena_alloc = self.global_scope['lambpie_arena_alloc']
-        tag = ir.Constant(ir.IntType(32), self.ARENA_STATIC)
-        obj_ptr_void = self.builder.call(arena_alloc, [tag, size], 'arena_call')
-        handler_instance = self.builder.bitcast(obj_ptr_void, handler_ptr_type, 'handler')
+        if not self.builder.block.is_terminated:
+            self.builder.ret_void()
 
-        # Call Handler.__init__ if it exists
-        init_method = 'Handler___init__'
-        if init_method in self.global_scope:
-            self.builder.call(self.global_scope[init_method], [handler_instance])
-
-        # Call Handler.init if it exists
-        init_user_method = 'Handler_init'
-        if init_user_method in self.global_scope:
-            self.builder.call(self.global_scope[init_user_method], [handler_instance])
-
-        # Store handler instance in global
-        self.builder.store(handler_instance, handler_global)
-        self.builder.ret_void()
-
-        # --- lambpie_handle(event_ptr, event_len, response_ptr, response_cap) -> usize ---
-        i8_ptr = self.types['__ptr__']
-        i64 = self.types['int']
+        # --- lambpie_handle(event_ptr, event_len, response_ptr, response_cap) -> i64 ---
         handle_func_type = ir.FunctionType(i64, [i8_ptr, i64, i8_ptr, i64])
         handle_func = ir.Function(self.module, handle_func_type, name='lambpie_handle')
-
-        # Name the arguments
         handle_func.args[0].name = 'event_ptr'
         handle_func.args[1].name = 'event_len'
         handle_func.args[2].name = 'response_ptr'
@@ -534,41 +748,150 @@ class Compiler(ast.NodeVisitor):
         entry = handle_func.append_basic_block(name='entry')
         self.builder = ir.IRBuilder(entry)
         self.local_scope = {}
+        self.current_arena = self.ARENA_REQ
 
-        # Alloca args for easy access
-        event_ptr_alloc = self.builder.alloca(i8_ptr, name='event_ptr.addr')
-        self.builder.store(handle_func.args[0], event_ptr_alloc)
-        event_len_alloc = self.builder.alloca(i64, name='event_len.addr')
-        self.builder.store(handle_func.args[1], event_len_alloc)
-        response_ptr_alloc = self.builder.alloca(i8_ptr, name='response_ptr.addr')
-        self.builder.store(handle_func.args[2], response_ptr_alloc)
-        response_cap_alloc = self.builder.alloca(i64, name='response_cap.addr')
-        self.builder.store(handle_func.args[3], response_cap_alloc)
+        event_ptr_val = handle_func.args[0]
+        event_len_val = handle_func.args[1]
+        response_ptr_val = handle_func.args[2]
 
-        # Load handler from global
-        handler_instance = self.builder.load(handler_global, name='handler')
+        # --- Deserialize event JSON → typed struct ---
+        # Allocate event struct on REQ arena
+        null_ptr = ir.Constant(event_ptr_type, None)
+        size_ptr = self.builder.gep(null_ptr, [ir.Constant(i32, 1)], inbounds=False)
+        size = self.builder.ptrtoint(size_ptr, i64, name='event.size')
+        arena_alloc = self.global_scope['lambpie_arena_alloc']
+        tag = ir.Constant(i32, self.ARENA_REQ)
+        event_raw = self.builder.call(arena_alloc, [tag, size], 'event.raw')
+        event_struct = self.builder.bitcast(event_raw, event_ptr_type, 'event.struct')
 
-        # Load event args
-        event_ptr_val = self.builder.load(event_ptr_alloc, name='event_ptr')
-        event_len_val = self.builder.load(event_len_alloc, name='event_len')
+        # Set ref_count = 1
+        ref_ptr = self.builder.gep(event_struct,
+            [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True, name='event.rc.ptr')
+        self.builder.store(ir.Constant(i32, 1), ref_ptr)
 
-        # Call Handler.handle(self, event_ptr, event_len) -> i64 (response length)
-        # The handler receives the event pointer and length, writes to response buffer,
-        # and returns the response length.
-        handle_method = 'Handler_handle'
-        if handle_method not in self.global_scope:
-            raise RuntimeError("Handler class must define a handle() method")
+        # For each field in event type, deserialize from JSON
+        event_fields = [(name, idx, typ) for name, (idx, typ) in event_layout.items()
+                        if name != '__ref_count__']
+        event_fields.sort(key=lambda f: f[1])
 
-        response_ptr_val = self.builder.load(response_ptr_alloc, name='response_ptr')
-        response_cap_val = self.builder.load(response_cap_alloc, name='response_cap')
+        for field_name, field_idx, field_type in event_fields:
+            # Create global string constant for field key
+            key_str = field_name + '\0'
+            key_const = ir.Constant(ir.ArrayType(ir.IntType(8), len(key_str)),
+                                    bytearray(key_str, 'utf8'))
+            self._name_counter += 1
+            key_global = ir.GlobalVariable(self.module, key_const.type, name=f".key.{self._name_counter}")
+            key_global.linkage = 'private'
+            key_global.initializer = key_const
+            key_ptr = key_global.gep([ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            key_len = ir.Constant(i64, len(field_name))
 
-        result_len = self.builder.call(
-            self.global_scope[handle_method],
-            [handler_instance, event_ptr_val, event_len_val, response_ptr_val, response_cap_val],
-            'result_len'
-        )
+            field_ptr = self.builder.gep(event_struct,
+                [ir.Constant(i32, 0), ir.Constant(i32, field_idx)],
+                inbounds=True, name=f'event.{field_name}.ptr')
 
-        self.builder.ret(result_len)
+            if self._is_str_type(field_type):
+                # str field: json_get_str → allocate str struct
+                out_len_alloc = self.builder.alloca(i64, name=f'{field_name}.len.out')
+                str_data = self.builder.call(json_get_str,
+                    [event_ptr_val, event_len_val, key_ptr, key_len, out_len_alloc],
+                    f'{field_name}.data')
+                str_len = self.builder.load(out_len_alloc, name=f'{field_name}.len')
+
+                # Allocate str struct on REQ arena
+                str_ptr_type = self.types['str']
+                str_null = ir.Constant(str_ptr_type, None)
+                str_size_ptr = self.builder.gep(str_null, [ir.Constant(i32, 1)], inbounds=False)
+                str_size = self.builder.ptrtoint(str_size_ptr, i64, name=f'{field_name}.str.size')
+                str_raw = self.builder.call(arena_alloc, [tag, str_size], f'{field_name}.str.raw')
+                str_struct = self.builder.bitcast(str_raw, str_ptr_type, f'{field_name}.str')
+
+                str_layout = self.class_layouts['str']
+                # Set ref_count = 1
+                src_rc_ptr = self.builder.gep(str_struct,
+                    [ir.Constant(i32, 0), ir.Constant(i32, str_layout['__ref_count__'][0])],
+                    inbounds=True)
+                self.builder.store(ir.Constant(i32, 1), src_rc_ptr)
+                # Set len
+                src_len_ptr = self.builder.gep(str_struct,
+                    [ir.Constant(i32, 0), ir.Constant(i32, str_layout['len'][0])],
+                    inbounds=True)
+                self.builder.store(str_len, src_len_ptr)
+                # Set buffer
+                src_buf_ptr = self.builder.gep(str_struct,
+                    [ir.Constant(i32, 0), ir.Constant(i32, str_layout['buffer'][0])],
+                    inbounds=True)
+                self.builder.store(str_data, src_buf_ptr)
+
+                self.builder.store(str_struct, field_ptr)
+
+            elif field_type == i64:
+                # int field: json_get_int
+                int_val = self.builder.call(json_get_int,
+                    [event_ptr_val, event_len_val, key_ptr, key_len],
+                    f'{field_name}.val')
+                self.builder.store(int_val, field_ptr)
+            else:
+                raise RuntimeError(f"Unsupported event field type for JSON deserialization: {field_name}")
+
+        # --- Call user's handle(event) → response struct ---
+        user_handle = self.global_scope['handle']
+        response_struct = self.builder.call(user_handle, [event_struct], 'response')
+
+        # --- Serialize response struct → JSON ---
+        pos = self.builder.call(json_open, [response_ptr_val, ir.Constant(i64, 0)], 'pos')
+
+        response_fields = [(name, idx, typ) for name, (idx, typ) in response_layout.items()
+                           if name != '__ref_count__']
+        response_fields.sort(key=lambda f: f[1])
+
+        for field_name, field_idx, field_type in response_fields:
+            # Create global string constant for field key
+            key_str = field_name + '\0'
+            key_const = ir.Constant(ir.ArrayType(ir.IntType(8), len(key_str)),
+                                    bytearray(key_str, 'utf8'))
+            self._name_counter += 1
+            key_global = ir.GlobalVariable(self.module, key_const.type, name=f".key.{self._name_counter}")
+            key_global.linkage = 'private'
+            key_global.initializer = key_const
+            key_ptr = key_global.gep([ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            key_len = ir.Constant(i64, len(field_name))
+
+            if self._is_str_type(field_type):
+                # Load str struct pointer, then extract buffer and len
+                str_field_ptr = self.builder.gep(response_struct,
+                    [ir.Constant(i32, 0), ir.Constant(i32, field_idx)],
+                    inbounds=True, name=f'resp.{field_name}.ptr')
+                str_struct = self.builder.load(str_field_ptr, name=f'resp.{field_name}')
+
+                str_layout = self.class_layouts['str']
+                buf_ptr = self.builder.gep(str_struct,
+                    [ir.Constant(i32, 0), ir.Constant(i32, str_layout['buffer'][0])],
+                    inbounds=True, name=f'resp.{field_name}.buf.ptr')
+                buf_val = self.builder.load(buf_ptr, name=f'resp.{field_name}.buf')
+                len_ptr = self.builder.gep(str_struct,
+                    [ir.Constant(i32, 0), ir.Constant(i32, str_layout['len'][0])],
+                    inbounds=True, name=f'resp.{field_name}.len.ptr')
+                len_val = self.builder.load(len_ptr, name=f'resp.{field_name}.len')
+
+                pos = self.builder.call(json_write_str,
+                    [response_ptr_val, pos, key_ptr, key_len, buf_val, len_val],
+                    'pos')
+
+            elif field_type == i64:
+                int_field_ptr = self.builder.gep(response_struct,
+                    [ir.Constant(i32, 0), ir.Constant(i32, field_idx)],
+                    inbounds=True, name=f'resp.{field_name}.ptr')
+                int_val = self.builder.load(int_field_ptr, name=f'resp.{field_name}')
+
+                pos = self.builder.call(json_write_int,
+                    [response_ptr_val, pos, key_ptr, key_len, int_val],
+                    'pos')
+            else:
+                raise RuntimeError(f"Unsupported response field type for JSON serialization: {field_name}")
+
+        pos = self.builder.call(json_close, [response_ptr_val, pos], 'pos.final')
+        self.builder.ret(pos)
 
 def main():
     import argparse
@@ -618,6 +941,14 @@ def main():
     with open(ir_filename, "w") as f:
         f.write(str(llvm_module))
     print(f"\nLLVM IR saved to {ir_filename}")
+
+    # 6. Save metadata
+    metadata = compiler.get_metadata()
+    if metadata:
+        meta_filename = f"{output_name}.lambpie.json"
+        with open(meta_filename, "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Metadata saved to {meta_filename}")
 
     print("\nTo build the Lambda bootstrap binary:")
     print(f"  python scripts/build.py {source_file}")

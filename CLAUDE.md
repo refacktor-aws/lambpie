@@ -24,26 +24,39 @@ python scripts/deploy.py --function-name my-func --build tests/echo.pie
 handler.pie → compiler.py → handler.ll → handler.o → shim crate → bootstrap
 ```
 
-- **compiler.py**: Python `ast` + `llvmlite`. Emits `lambpie_init()` + `lambpie_handle()` as extern "C".
-- **runtime/src/**: C runtime (runtime.c) — HTTP, sockets, Lambda API protocol.
+- **compiler.py**: Python `ast` + `llvmlite`. Emits `lambpie_init()` + `lambpie_handle()` as extern "C". Auto-generates JSON marshaling.
+- **runtime/src/**: C runtime (runtime.c — HTTP, sockets, Lambda API protocol; json.c — non-allocating JSON parse/serialize).
 - **runtime/rust-binding/**: `no_std` Rust FFI wrapper around the C runtime.
 - **runtime/shim/**: `no_std`, `no_main` crate. Provides `_start()`, links handler.o, bridges event loop.
 - **scripts/**: build.py, deploy.py (boto3), test.py.
 
-## Handler Convention
+## Handler Convention (Flat Module Model)
 
 ```python
-class Handler:
-    def init(self) -> None:        # cold-start (called once)
-        pass
-    def handle(self, event_ptr: __ptr__, event_len: int,
-               response_ptr: __ptr__, response_cap: int) -> int:
-        return 0                   # returns response length
+class Request:
+    message: str
+    number: int
+
+class Response:
+    status: str
+    echo: str
+    doubled: int
+
+def handle(event: Request) -> Response:
+    return Response("ok", event.message, event.number + event.number)
 ```
+
+- Define event/response as classes with typed fields (`str`, `int`)
+- Top-level `def handle(event: T) -> R` is the entry point
+- Compiler auto-generates `__init__` for data classes (no need to write one)
+- Compiler generates JSON deserialization (event) and serialization (response)
+- String literals auto-coerce to `str` structs
+- Top-level statements (outside `handle`) become `lambpie_init()` body
+- Compiler emits `target/<name>.lambpie.json` metadata alongside `.ll`
 
 ## Memory Model (Dual-Arena)
 
-- **Static arena** (tag 0): allocations in `__init__`/`init()`, persists across invocations, frozen after init via mprotect
+- **Static arena** (tag 0): allocations in top-level init code, persists across invocations, frozen after init via mprotect
 - **Request arena** (tag 1): allocations in `handle()`, bulk-reset after each invocation
 - Forward-pointer protection is provided by mprotect (static arena read-only = runtime SIGSEGV on write)
 

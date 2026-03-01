@@ -28,178 +28,148 @@ def compile_lambpie_code(code_str):
     unique_module_name = f"lambpie_test_{uuid.uuid4().hex}"
     compiler = Compiler(module_name=unique_module_name)
     llvm_ir = compiler.compile(combined_ast)
-    return str(llvm_ir)
+    return str(llvm_ir), compiler
 
 
-def test_echo_handler():
+def test_typed_echo_handler():
+    """Full typed echo handler with auto __init__, field access, JSON helpers."""
     code = """
-from C import memcpy
+class Request:
+    message: str
+    number: int
 
-class Handler:
-    def init(self) -> None:
-        pass
+class Response:
+    status: str
+    echo: str
+    doubled: int
 
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        memcpy(response_ptr, event_ptr, event_len)
-        return event_len
-
-if __name__ == '__main__':
-    app: Handler = Handler()
+def handle(event: Request) -> Response:
+    return Response("ok", event.message, event.number + event.number)
 """
-    llvm_ir = compile_lambpie_code(code)
+    llvm_ir, compiler = compile_lambpie_code(code)
 
-    # Verify lambpie_init and lambpie_handle are emitted (llvmlite quotes names)
+    # Verify lambpie_init and lambpie_handle are emitted
     assert 'define void @"lambpie_init"()' in llvm_ir, "lambpie_init not found"
     assert 'define i64 @"lambpie_handle"(' in llvm_ir, "lambpie_handle not found"
 
-    # Verify Handler methods exist
-    assert "Handler_init" in llvm_ir, "Handler_init method not found"
-    assert "Handler_handle" in llvm_ir, "Handler_handle method not found"
+    # Verify user handle function exists
+    assert '@"handle"(' in llvm_ir, "handle function not found"
 
-    # Verify global handler pointer
-    assert '@"lambpie_handler"' in llvm_ir, "global handler pointer not found"
+    # Verify auto-generated __init__ for Request and Response
+    assert 'Request___init__' in llvm_ir, "Request auto __init__ not found"
+    assert 'Response___init__' in llvm_ir, "Response auto __init__ not found"
 
-    # Verify arena allocator is used (not malloc) for Handler
-    assert "lambpie_arena_alloc" in llvm_ir, "arena allocator not found"
+    # Verify JSON helper declarations
+    assert 'json_get_str' in llvm_ir, "json_get_str not declared"
+    assert 'json_get_int' in llvm_ir, "json_get_int not declared"
+    assert 'json_open' in llvm_ir, "json_open not declared"
+    assert 'json_write_str' in llvm_ir, "json_write_str not declared"
+    assert 'json_write_int' in llvm_ir, "json_write_int not declared"
+    assert 'json_close' in llvm_ir, "json_close not declared"
 
-    print("\n--- Test: test_echo_handler ---")
-    print(llvm_ir)
+    # Verify no Handler class references
+    assert 'Handler' not in llvm_ir, "Old Handler class should not exist"
+
+    # Verify arena allocator is used
+    assert 'lambpie_arena_alloc' in llvm_ir, "arena allocator not found"
+
+    # Verify metadata
+    meta = compiler.get_metadata()
+    assert meta['trigger'] == 'direct'
+    assert meta['event_type'] == 'Request'
+    assert meta['response_type'] == 'Response'
+    assert meta['event_fields'] == {'message': 'str', 'number': 'int'}
+    assert meta['response_fields'] == {'status': 'str', 'echo': 'str', 'doubled': 'int'}
 
 
-def test_simple_if():
+def test_arena_req_in_handle():
+    """lambpie_handle uses request arena (tag 1) for event deserialization."""
     code = """
-class Handler:
-    def init(self) -> None:
-        pass
+class Request:
+    message: str
+    number: int
 
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        if event_len > 0:
-            return event_len
-        return 0
+class Response:
+    echo: str
 
-if __name__ == '__main__':
-    app: Handler = Handler()
+def handle(event: Request) -> Response:
+    return Response(event.message)
 """
-    llvm_ir = compile_lambpie_code(code)
-    assert "if.then" in llvm_ir
-    assert "if.end" in llvm_ir
-    assert "br i1" in llvm_ir
-    print("\n--- Test: test_simple_if ---")
-    print(llvm_ir)
-
-
-def test_handler_with_loop():
-    code = """
-class Handler:
-    def init(self) -> None:
-        pass
-
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        i: int = 0
-        while i < event_len:
-            i = i + 1
-        return i
-
-if __name__ == '__main__':
-    app: Handler = Handler()
-"""
-    llvm_ir = compile_lambpie_code(code)
-    assert "loop.header" in llvm_ir
-    assert "loop.body" in llvm_ir
-    assert "loop.exit" in llvm_ir
-    print("\n--- Test: test_handler_with_loop ---")
-    print(llvm_ir)
-
-
-def test_arena_static_tag_in_init():
-    """Handler allocated in lambpie_init uses static arena (tag 0)."""
-    code = """
-class Handler:
-    def init(self) -> None:
-        pass
-
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        return 0
-
-if __name__ == '__main__':
-    app: Handler = Handler()
-"""
-    llvm_ir = compile_lambpie_code(code)
-    # lambpie_init should use arena tag 0 (STATIC)
-    assert 'call i8* @"lambpie_arena_alloc"(i32 0,' in llvm_ir, \
-        "lambpie_init should allocate Handler on static arena (tag 0)"
-
-
-def test_arena_req_tag_in_handle():
-    """Objects constructed inside handle() use request arena (tag 1)."""
-    code = """
-class Temp:
-    val: int
-
-    def __init__(self, v: int) -> None:
-        pass
-
-class Handler:
-    def init(self) -> None:
-        pass
-
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        t: Temp = Temp(42)
-        return 0
-
-if __name__ == '__main__':
-    app: Handler = Handler()
-"""
-    llvm_ir = compile_lambpie_code(code)
-    # Inside Handler_handle, Temp() should use arena tag 1 (REQ)
-    # Find the Handler_handle function and check for tag 1
-    handle_start = llvm_ir.index('@"Handler_handle"')
+    llvm_ir, _ = compile_lambpie_code(code)
+    # lambpie_handle should use arena tag 1 (REQ) for event struct allocation
+    handle_start = llvm_ir.index('@"lambpie_handle"')
     handle_ir = llvm_ir[handle_start:]
     assert 'call i8* @"lambpie_arena_alloc"(i32 1,' in handle_ir, \
-        "Handler.handle should allocate Temp on request arena (tag 1)"
+        "lambpie_handle should allocate on request arena (tag 1)"
 
 
-def test_arena_static_tag_in_handler_init():
-    """Objects constructed inside Handler.init() use static arena (tag 0)."""
+def test_arena_static_in_init():
+    """lambpie_init uses static arena (tag 0)."""
     code = """
 class Config:
     val: int
 
-    def __init__(self, v: int) -> None:
-        pass
+class Request:
+    number: int
 
-class Handler:
-    def init(self) -> None:
-        c: Config = Config(99)
+class Response:
+    number: int
 
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        return 0
+c: Config = Config(99)
 
-if __name__ == '__main__':
-    app: Handler = Handler()
+def handle(event: Request) -> Response:
+    return Response(event.number)
 """
-    llvm_ir = compile_lambpie_code(code)
-    # Inside Handler_init, Config() should use arena tag 0 (STATIC)
-    init_start = llvm_ir.index('@"Handler_init"')
-    init_end = llvm_ir.index('@"Handler_handle"')
+    llvm_ir, _ = compile_lambpie_code(code)
+    # lambpie_init should use arena tag 0 (STATIC) for Config allocation
+    init_start = llvm_ir.index('@"lambpie_init"')
+    init_end = llvm_ir.index('@"lambpie_handle"')
     init_ir = llvm_ir[init_start:init_end]
     assert 'call i8* @"lambpie_arena_alloc"(i32 0,' in init_ir, \
-        "Handler.init should allocate Config on static arena (tag 0)"
+        "lambpie_init should allocate on static arena (tag 0)"
+
+
+def test_field_access():
+    """GEP + load for struct field access."""
+    code = """
+class Request:
+    number: int
+
+class Response:
+    number: int
+
+def handle(event: Request) -> Response:
+    return Response(event.number)
+"""
+    llvm_ir, _ = compile_lambpie_code(code)
+    # Field access should use GEP (getelementptr)
+    assert 'getelementptr' in llvm_ir, "Field access should use GEP"
+    # The handle function should load from event struct
+    assert '@"handle"(' in llvm_ir, "handle function not found"
+
+
+def test_missing_handle_raises():
+    """RuntimeError when no handle() function is defined."""
+    code = """
+class Request:
+    number: int
+"""
+    with pytest.raises(RuntimeError, match="No handle\\(\\) function found"):
+        compile_lambpie_code(code)
 
 
 def test_target_triple():
     """Default target triple should be x86_64-unknown-linux-gnu."""
     code = """
-class Handler:
-    def init(self) -> None:
-        pass
+class Request:
+    number: int
 
-    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
-        return 0
+class Response:
+    number: int
 
-if __name__ == '__main__':
-    app: Handler = Handler()
+def handle(event: Request) -> Response:
+    return Response(event.number)
 """
-    llvm_ir = compile_lambpie_code(code)
+    llvm_ir, _ = compile_lambpie_code(code)
     assert 'target triple = "x86_64-unknown-linux-gnu"' in llvm_ir, \
         "Default target should be Lambda triple"

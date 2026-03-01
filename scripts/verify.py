@@ -17,6 +17,7 @@ import boto3
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FUNCTION_NAME = 'lambpie-echo-test'
 TEST_EVENT = {"message": "hello from lambpie", "number": 42}
+EXPECTED_RESPONSE = {"status": "ok", "echo": "hello from lambpie", "doubled": 84}
 
 
 def wait_for_localstack(endpoint, max_retries=30):
@@ -127,12 +128,12 @@ def main():
         print(f"Error: Response is not valid JSON: {response_text}")
         sys.exit(1)
 
-    # Verify echo: response should exactly match the input
-    if response_data != TEST_EVENT:
-        print(f"FAIL: Expected {TEST_EVENT}, got {response_data}")
+    # Verify typed response
+    if response_data != EXPECTED_RESPONSE:
+        print(f"FAIL: Expected {EXPECTED_RESPONSE}, got {response_data}")
         sys.exit(1)
 
-    print("PASS: Echo handler returned the input event exactly.")
+    print("PASS")
 
     # Cleanup
     client.delete_function(FunctionName=FUNCTION_NAME)
