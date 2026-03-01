@@ -74,8 +74,14 @@ Banned patterns:
 
 Specialist agents are defined in `.claude/agents/`. They are auto-loaded by Claude Code:
 
-1. **compiler-specialist** — compiler.py, builtins.pie, type system, AST visitors, codegen
-2. **rust-runtime** — runtime/rust-binding/, runtime/shim/, no_std FFI, Writer API
-3. **c-runtime** — runtime/src/, HTTP protocol, arena allocator, Lambda API
-4. **aws-integration** — scripts/deploy.py, SigV4, botocore models, boto3 shims
-5. **build-toolchain** — scripts/build.py, cross-compilation, llc, cargo, Docker
+### Management
+1. **fpm** — Functional PM: top-level orchestrator, loops tpm + qa-tester until done
+2. **tpm** — Technical PM: assesses project state, produces prioritized top-10 work items
+3. **qa-tester** — QA: runs all tests, checks quality, reports pass/fail
+
+### Specialists
+4. **compiler-specialist** — compiler.py, builtins.pie, type system, AST visitors, codegen
+5. **rust-runtime** — runtime/rust-binding/, runtime/shim/, no_std FFI, Writer API
+6. **c-runtime** — runtime/src/, HTTP protocol, arena allocator, Lambda API
+7. **aws-integration** — scripts/deploy.py, SigV4, botocore models, boto3 shims
+8. **build-toolchain** — scripts/build.py, cross-compilation, llc, cargo, Docker

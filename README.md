@@ -1,8 +1,8 @@
 # lambpie
 
-A minimalist language for coding highly-efficient AWS Lambda functions. It features AWS SDK as built-in language primitives (hence, no library bloat) and a strict dual-arena (static & request-time) memory management system. It is intended to be safe and highly efficient for solving simple problems, and its syntax provides an easy exit hatch to Python when complexity grows.
+A minimalist Python-like language for coding highly-efficient AWS Lambda functions, natively compiled to LLVM. It features AWS SDK as built-in language primitives (hence, no library bloat) and a strict dual-arena (static & request-time) memory management system. It is intended to be type safe, memory safe, and highly efficient for solving simple problems, and its syntax provides an easy exit hatch to Python when complexity grows.
 
-Valid `.pie` is valid Python 3. Rename to `.py` and it runs with boto3.
+`escape.py` converts `.pie` into valid Python.
 
 ## Example
 

@@ -1,5 +1,8 @@
+#define _GNU_SOURCE
+
 #include "arena.h"
 #include <sys/mman.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 

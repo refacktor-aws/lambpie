@@ -1,0 +1,16 @@
+services:
+  localstack:
+    image: localstack/localstack:3.0
+    ports:
+      - "4577:4566"
+    environment:
+      - SERVICES=lambda
+      - LAMBDA_EXECUTOR=docker
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
