@@ -86,3 +86,7 @@ Return a structured report:
 ```
 
 Be thorough but concise. Every finding must include a file path and line number where possible. Do not suggest fixes — just report facts.
+
+## Critical Rule
+
+**Always verify files exist on disk before reporting them as created.** Never trust agent self-reports. Use Glob or Read to confirm file existence. If a file is claimed to exist but does not, report it as a finding.
