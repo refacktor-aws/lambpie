@@ -47,6 +47,20 @@ class Handler:
 - **Request arena** (tag 1): allocations in `handle()`, bulk-reset after each invocation
 - Forward-pointer protection is provided by mprotect (static arena read-only = runtime SIGSEGV on write)
 
+## Coding Standards
+
+**Fail fast and hard, always.** If something is unrecognized, unknown, or missing — raise an error immediately. Never substitute a dumb default, never print a warning and continue, never silently swallow. A compile error is always better than wrong IR. A missing CLI argument is always better than a hidden default that surprises in production.
+
+Banned patterns:
+- Fallback to a dummy type/value for unrecognized input (e.g. `void()` for unknown C import)
+- `else: pass` that silently ignores an unhandled case
+- `print("Warning: ...")` followed by `return` instead of `raise`
+- Hardcoded magic numbers buried in code (e.g. `MemorySize=128`) — make them explicit arguments
+
+**No debug print in production paths.** Use `raise` or `sys.exit(msg)`. Gate tracing behind `--verbose`.
+
+**No hash-based naming.** `abs(hash(x))` collides. Use a monotonic counter.
+
 ## Key Decisions
 
 - TLS: dynamic-link OpenSSL from AL2023 (zero binary cost)

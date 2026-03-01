@@ -33,6 +33,8 @@ def main():
                         help='Path to the bootstrap binary')
     parser.add_argument('--region', default=None, help='AWS region')
     parser.add_argument('--role', default=None, help='IAM role ARN for creating new functions')
+    parser.add_argument('--memory', type=int, default=None, help='Memory size in MB (required for new functions)')
+    parser.add_argument('--timeout', type=int, default=None, help='Timeout in seconds (required for new functions)')
     args = parser.parse_args()
 
     # Optionally build first
@@ -64,9 +66,15 @@ def main():
         )
         print("Function updated.")
     except client.exceptions.ResourceNotFoundException:
+        missing = []
         if not args.role:
-            print("Error: Function does not exist and --role not specified.")
-            print("Provide --role to create a new function.")
+            missing.append('--role')
+        if not args.memory:
+            missing.append('--memory')
+        if not args.timeout:
+            missing.append('--timeout')
+        if missing:
+            print(f"Error: Function does not exist. Required for creation: {', '.join(missing)}")
             sys.exit(1)
 
         print(f"Creating function {args.function_name}...")
@@ -76,8 +84,8 @@ def main():
             Role=args.role,
             Handler='bootstrap',
             Code={'ZipFile': zip_bytes},
-            MemorySize=128,
-            Timeout=10,
+            MemorySize=args.memory,
+            Timeout=args.timeout,
         )
         print("Function created.")
 

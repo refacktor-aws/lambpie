@@ -81,6 +81,9 @@ class Compiler(ast.NodeVisitor):
         # Maps variable name -> arena tag (ARENA_STATIC or ARENA_REQ)
         self.arena_tags = {}
 
+        # Monotonic counter for collision-free global names
+        self._name_counter = 0
+
     def _get_type(self, annotation_node):
         if isinstance(annotation_node, ast.Name):
             type_name = annotation_node.id
@@ -126,21 +129,24 @@ class Compiler(ast.NodeVisitor):
         if node.module == 'C':
             for alias in node.names:
                 name = alias.name
-                if name == 'printf':
-                    func_type = ir.FunctionType(ir.IntType(32), [self.types['__ptr__']], var_arg=True)
-                elif name == 'atoi':
-                    func_type = ir.FunctionType(self.types['int'], [self.types['__ptr__']])
-                else:
-                    func_type = ir.FunctionType(ir.VoidType(), [])
+                if name in self.global_scope:
+                    continue  # already declared (e.g. memcpy pre-declared in __init__)
 
-                if name not in self.global_scope:
-                    self.global_scope[name] = ir.Function(self.module, func_type, name=name)
+                C_SIGNATURES = {
+                    'printf': ir.FunctionType(ir.IntType(32), [self.types['__ptr__']], var_arg=True),
+                    'atoi': ir.FunctionType(self.types['int'], [self.types['__ptr__']]),
+                    'strlen': ir.FunctionType(self.types['int'], [self.types['__ptr__']]),
+                    'free': ir.FunctionType(ir.VoidType(), [self.types['__ptr__']]),
+                }
+                if name not in C_SIGNATURES:
+                    raise TypeError(f"Unknown C function signature: {name}. Add it to C_SIGNATURES in visit_ImportFrom.")
+                func_type = C_SIGNATURES[name]
+
+                self.global_scope[name] = ir.Function(self.module, func_type, name=name)
         else:
-            pass
+            raise ImportError(f"Unknown module: {node.module}. Only 'from C import ...' is supported.")
 
     def visit_ClassDef(self, node):
-        print(f"Found class: {node.name}")
-
         class_name = node.name
         class_type = self.module.context.get_identified_type(class_name)
 
@@ -161,7 +167,6 @@ class Compiler(ast.NodeVisitor):
 
         self.types[class_name] = class_type.as_pointer()
         self.class_layouts[class_name] = attributes
-        print(f"  - Layout for {class_name}: {attributes}")
 
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
@@ -171,8 +176,6 @@ class Compiler(ast.NodeVisitor):
         func_name = node.name
         if class_name:
             func_name = f"{class_name}_{func_name}"
-
-        print(f"Found function/method: {func_name}")
 
         # Set arena context based on which Handler method we're compiling
         saved_arena = self.current_arena
@@ -246,7 +249,8 @@ class Compiler(ast.NodeVisitor):
             c_string = ir.Constant(ir.ArrayType(ir.IntType(8), len(string_val)),
                                    bytearray(string_val, 'utf8'))
 
-            global_var = ir.GlobalVariable(self.module, c_string.type, name=f".str.{abs(hash(node.value))}")
+            self._name_counter += 1
+            global_var = ir.GlobalVariable(self.module, c_string.type, name=f".str.{self._name_counter}")
             global_var.linkage = 'private'
             global_var.initializer = c_string
 
@@ -257,8 +261,9 @@ class Compiler(ast.NodeVisitor):
             c_bytes = ir.Constant(ir.ArrayType(ir.IntType(8), len(byte_vals)),
                                   byte_vals)
 
+            self._name_counter += 1
             global_var = ir.GlobalVariable(self.module, c_bytes.type,
-                                           name=f".bytes.{abs(hash(node.value))}")
+                                           name=f".bytes.{self._name_counter}")
             global_var.linkage = 'private'
             global_var.initializer = c_bytes
             global_var.global_constant = True
@@ -472,8 +477,7 @@ class Compiler(ast.NodeVisitor):
         """
         # Verify Handler class exists
         if 'Handler' not in self.types:
-            print("Warning: No Handler class found. Skipping Lambda entry synthesis.")
-            return
+            raise RuntimeError("No Handler class found. Every .pie file must define a Handler class.")
 
         handler_ptr_type = self.types['Handler']
         handler_struct_type = handler_ptr_type.pointee
