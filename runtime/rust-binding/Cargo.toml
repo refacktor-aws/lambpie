@@ -1,0 +1,17 @@
+[package]
+name = "aws_lambda_libc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = { version = "0.2.167", default-features = false }
+
+[build-dependencies]
+cc = "1.0"
+
+[lib]
+name = "aws_lambda_libc"
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"

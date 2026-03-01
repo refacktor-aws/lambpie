@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+target/
+*.ll
+*.o
+*.obj
+*.exe
+.pytest_cache/

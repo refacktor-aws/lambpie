@@ -1,0 +1,21 @@
+from C import malloc, free, strlen, memcpy
+
+class str:
+    len: int
+    buffer: __ptr__
+
+    def __init__(self, c_str: __ptr__) -> None:
+        pass
+
+    def __del__(self) -> None:
+        pass
+
+class bytearray:
+    len: int
+    buffer: __ptr__
+
+    def __init__(self, size: int) -> None:
+        pass
+
+    def __del__(self) -> None:
+        pass

@@ -1,0 +1,12 @@
+from C import memcpy
+
+class Handler:
+    def init(self) -> None:
+        pass
+
+    def handle(self, event_ptr: __ptr__, event_len: int, response_ptr: __ptr__, response_cap: int) -> int:
+        memcpy(response_ptr, event_ptr, event_len)
+        return event_len
+
+if __name__ == '__main__':
+    app: Handler = Handler()
